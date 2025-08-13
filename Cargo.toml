@@ -3,4 +3,16 @@ name = "tors-rs"
 version = "0.1.0"
 edition = "2024"
 
+[profile.release]
+strip = true
+lto = true
+panic = "abort"
+
 [dependencies]
+hex = "0.4.3"
+reqwest = "0.12.22"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_bencode = "0.2.4"
+sha1 = "0.10.6"
+tokio = { version = "1.47.1", features = ["macros", "rt", "rt-multi-thread"] }
+urlencoding = "2.1.3"
