@@ -1,6 +1,8 @@
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer};
 
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 pub enum TrackerResponse {
@@ -38,8 +40,27 @@ pub enum TrackerResponse {
 #[derive(Debug)]
 pub struct Peers(pub Vec<Peer>);
 
-struct PeersVisitor;
+#[derive(Debug)]
+pub struct Peer {
+    pub socket_addr: std::net::SocketAddr,
+    am_choking: bool,
+    am_interested: bool,
+    peer_choking: bool,
+    peer_interested: bool,
+}
+impl Default for Peer {
+    fn default() -> Self {
+        Self {
+            socket_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+            am_choking: true,
+            am_interested: false,
+            peer_choking: true,
+            peer_interested: false,
+        }
+    }
+}
 
+struct PeersVisitor;
 impl<'de> Visitor<'de> for PeersVisitor {
     type Value = Peers;
 
@@ -59,22 +80,25 @@ impl<'de> Visitor<'de> for PeersVisitor {
         Ok(Peers(
             value
                 .chunks_exact(6)
-                .map(|b| Peer::Compact {
-                    ip_addr: u32::from_be_bytes([b[0], b[1], b[2], b[3]]),
-                    port: u16::from_be_bytes([b[4], b[5]]),
+                .map(|b| {
+                    let ip_addr = std::net::Ipv4Addr::new(b[0], b[1], b[2], b[3]);
+                    let port = u16::from_be_bytes([b[4], b[5]]);
+                    Peer {
+                        socket_addr: SocketAddr::new(std::net::IpAddr::V4(ip_addr), port),
+                        ..Default::default()
+                    }
                 })
                 .collect(),
         ))
     }
-    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+
+    fn visit_seq<A>(self, mut _seq: A) -> Result<Self::Value, A::Error>
     where
         A: de::SeqAccess<'de>,
     {
-        let mut peers = vec![];
-        while let Some(peer) = seq.next_element::<Peer>()? {
-            peers.push(peer);
-        }
-        Ok(Peers(peers))
+        let mut _peers = vec![];
+        todo!();
+        Ok(Peers(_peers))
     }
 }
 
@@ -86,21 +110,3 @@ impl<'de> Deserialize<'de> for Peers {
         deserializer.deserialize_bytes(PeersVisitor)
     }
 }
-
-#[derive(Debug, Deserialize, Clone)]
-#[serde(untagged)]
-pub enum Peer {
-    Expanded {
-        /// Peer's self-selected ID, as described above for the tracker request
-        #[serde(rename = "peer id")]
-        peer_id: String,
-        /// peer's IP address either IPv6 (hexed) or IPv4 (dotted quad) or DNS name (string)
-        #[serde(rename = "ip")]
-        ip_addr: String,
-        /// peer's port number
-        port: u16,
-    },
-    /// First 4 bytes are the IP address and last 2 bytes are the port number. All in network (big endian) notation.
-    Compact { ip_addr: u32, port: u16 },
-}
-
