@@ -1,8 +1,9 @@
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer};
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use crate::Peer;
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 pub enum TrackerResponse {
@@ -40,26 +41,6 @@ pub enum TrackerResponse {
 #[derive(Debug)]
 pub struct Peers(pub Vec<Peer>);
 
-#[derive(Debug)]
-pub struct Peer {
-    pub socket_addr: std::net::SocketAddr,
-    am_choking: bool,
-    am_interested: bool,
-    peer_choking: bool,
-    peer_interested: bool,
-}
-impl Default for Peer {
-    fn default() -> Self {
-        Self {
-            socket_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
-            am_choking: true,
-            am_interested: false,
-            peer_choking: true,
-            peer_interested: false,
-        }
-    }
-}
-
 struct PeersVisitor;
 impl<'de> Visitor<'de> for PeersVisitor {
     type Value = Peers;
@@ -78,17 +59,7 @@ impl<'de> Visitor<'de> for PeersVisitor {
             ));
         }
         Ok(Peers(
-            value
-                .chunks_exact(6)
-                .map(|b| {
-                    let ip_addr = std::net::Ipv4Addr::new(b[0], b[1], b[2], b[3]);
-                    let port = u16::from_be_bytes([b[4], b[5]]);
-                    Peer {
-                        socket_addr: SocketAddr::new(std::net::IpAddr::V4(ip_addr), port),
-                        ..Default::default()
-                    }
-                })
-                .collect(),
+            value.chunks_exact(6).filter_map(Peer::from_bytes).collect(),
         ))
     }
 
@@ -96,9 +67,7 @@ impl<'de> Visitor<'de> for PeersVisitor {
     where
         A: de::SeqAccess<'de>,
     {
-        let mut _peers = vec![];
         todo!();
-        Ok(Peers(_peers))
     }
 }
 

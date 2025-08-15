@@ -2,9 +2,8 @@ use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 
-
 #[allow(dead_code)]
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct Metadata {
     /// URL of the tracker
     // kind of annoying, but need to then convert this into a valid URL to check instead of
@@ -30,7 +29,7 @@ pub struct Metadata {
     url_list: Option<Vec<String>>,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct TorrInfo {
     /// The suggested name of the file being downloaded
     pub name: String,
@@ -49,7 +48,7 @@ pub struct TorrInfo {
     pub private: Option<usize>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Hashes(Vec<[u8; 20]>);
 struct HashesVisitor;
 
@@ -95,7 +94,7 @@ impl Serialize for Hashes {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(untagged)]
 pub enum FileTypes {
     SingleFile {
@@ -107,7 +106,7 @@ pub enum FileTypes {
     },
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct File {
     /// The length of the file in bytes
     length: usize,
