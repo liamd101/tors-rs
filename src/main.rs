@@ -3,6 +3,12 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::task::JoinSet;
+use tokio_util::bytes::{Buf, BytesMut};
+use tokio_util::codec::Decoder;
+
+use tracing::{Instrument, debug, error, info, warn};
+use tracing_subscriber::{self, EnvFilter};
 
 mod tracker;
 use tracker::TrackerResponse;
@@ -28,12 +34,15 @@ fn get_info_hash(info: &parsing::TorrInfo) -> [u8; 20] {
 
 #[tokio::main]
 async fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::new("debug"))
+        .init();
+
     // let testing_string: String = "d7:meaningi42e4:wiki7:bencodee".into();
     let torr_path: PathBuf = PathBuf::from("sample.torrent");
 
     if !torr_path.exists() {
-        println!("torr_path={torr_path:?}");
-        println!("file does not exist");
+        error!("file does not exist");
         return;
     }
 
@@ -43,7 +52,7 @@ async fn main() {
     match announce.scheme() {
         "http" | "https" => {}
         _ => {
-            println!("invalid scheme");
+            error!("invalid scheme");
             return;
         }
     }
@@ -89,73 +98,104 @@ async fn main() {
     let peers = match res {
         TrackerResponse::Success { peers, .. } => peers.0,
         TrackerResponse::Error { failure_reason } => {
-            println!("{failure_reason}");
+            error!("{failure_reason}");
             return;
         }
     };
+    debug!("tracker supplied {} peers", peers.len());
     // now to connect to a peer
 
     let handshake = PeerHandshake::v1(info_hash, peer_id);
-    let handshake_bytes = handshake.to_bytes();
 
-    // TODO: handle incoming connections from peers
+    // TODO: maybe specify a limit of peers we can connect to at once?
+    let mut set = JoinSet::new();
 
     // TODO: this should probably use threads to download files in parallel
     for peer in &peers {
         let stream = tokio::net::TcpStream::connect(peer.socket_addr)
             .await
             .expect("unable to connect to peer");
-        /*
-        tokio::spawn(async move {
-            handle_peer(
-                std::sync::Arc::new(metadata),
-                stream,
-                std::sync::Arc::new(Mutex::new(peer)),
-            )
-            .await
+
+        let metadata = metadata.clone();
+        let handshake = handshake.clone();
+        let peer_addr = peer.socket_addr;
+
+        set.spawn(async move {
+            handle_peer(metadata, handshake, stream, peer_addr).await;
         });
-        */
-        handle_peer(&metadata, &handshake, stream, &peer).await;
     }
 
-    // tokio::join!();
+    while set.join_next().await.is_some() {}
 }
 
 use tokio::net::TcpStream;
 
 async fn handle_peer(
-    metadata: &Metadata,
-    handshake: &PeerHandshake,
+    metadata: Metadata,
+    handshake: PeerHandshake,
     mut stream: TcpStream,
-    peer: &Peer,
+    peer_addr: std::net::SocketAddr,
 ) {
-    let handshake_bytes = handshake.to_bytes();
+    let span = tracing::info_span!("peer", peer_addr = %peer_addr);
+    async move {
+        debug!("handling peer connection");
 
-    println!("{:?}", peer.socket_addr);
+        let handshake_bytes = handshake.to_bytes();
 
-    stream
-        .write_all(&handshake_bytes)
-        .await
-        .expect("couldn't write to peer");
+        stream
+            .write_all(&handshake_bytes)
+            .await
+            .expect("couldn't write to peer");
 
-    // first read will be 68 bytes the majority of the time according to the bittorrent spec
-    let mut parts = vec![0u8; 68];
+        // first read will be 68 bytes the majority of the time according to the bittorrent spec
+        let mut parts = vec![0u8; 68];
 
-    stream
-        .read_exact(&mut parts)
-        .await
-        .expect("error reading from stream");
+        stream
+            .read_exact(&mut parts)
+            .await
+            .expect("error reading from stream");
 
-    let peer_response = PeerHandshake::from_bytes(&parts).expect("invalid peer response");
-    // eprintln!("{peer_response:?}");
-    println!("{}", hex::encode(peer_response.peer_id));
-    if peer_response.info_hash != handshake.info_hash {
-        println!("invalid info_hash received");
+        let peer_response = PeerHandshake::from_bytes(&parts).expect("invalid peer response");
+        if peer_response.info_hash != handshake.info_hash {
+            warn!("invalid info_hash received. closing connection");
+            stream.shutdown().await.expect("shutdown call failed");
+            return;
+        }
+
+        // TODO: helper function for making bitfield
+        let length = match metadata.info.torr_type {
+            parsing::FileTypes::SingleFile { length } => length,
+            _ => unimplemented!("don't have support for multiple files yet"),
+        };
+        // round up number of pieces
+        let mut message_decoder = MessageDecoder {};
+        /// open file, check if each piece has been fully downloaded? probably should have a parent
+        /// thread be in charge of this part though
+        let mut buf = BytesMut::new();
+        loop {
+            let len = stream
+                .read_buf(&mut buf)
+                .await
+                .expect("didn't receive all bytes");
+            let Some(message) = message_decoder.decode_eof(&mut buf).expect("invalid read") else {
+                continue;
+            };
+            if message.message_id.is_none() {
+                continue;
+            }
+            debug!("message header received: {message:?}");
+            let payload = buf[..message.length as usize - 1].to_vec();
+            buf.advance(message.length as usize - 1);
+            debug!("message payload: {payload:?}");
+        }
+
+        stream.shutdown().await.expect("shutdown call failed");
     }
-    stream.shutdown().await.expect("shutdown call failed");
+    .instrument(span)
+    .await
 }
 
-/// A struct representing messages between peers
+/// A struct representing message headers between peers
 /// All communication between peers in the BitTorrent protocol is communicated in Messages of this
 /// format
 #[repr(C)]
@@ -165,117 +205,13 @@ struct Message {
     length: u32,
     /// Optional parameter indicating the type of message being communciated
     /// This value is only None in a keep-alive message (i.e. length == 0)
-    message_id: Option<MessageIds>,
-    /// The payload being comminicated
-    payload: Option<Vec<u8>>,
-}
-
-impl Message {
-    pub fn keep_alive() -> Self {
-        Self {
-            length: 0,
-            message_id: None,
-            payload: None,
-        }
-    }
-
-    pub fn choke() -> Self {
-        Self {
-            length: 1,
-            message_id: Some(MessageIds::Choke),
-            payload: None,
-        }
-    }
-
-    pub fn unchoke() -> Self {
-        Self {
-            length: 1,
-            message_id: Some(MessageIds::UnChoke),
-            payload: None,
-        }
-    }
-
-    pub fn interested() -> Self {
-        Self {
-            length: 1,
-            message_id: Some(MessageIds::Interested),
-            payload: None,
-        }
-    }
-
-    pub fn not_interested() -> Self {
-        Self {
-            length: 1,
-            message_id: Some(MessageIds::NotInterested),
-            payload: None,
-        }
-    }
-
-    pub fn have(index: u32) -> Self {
-        Self {
-            length: 5,
-            message_id: Some(MessageIds::NotInterested),
-            payload: Some(u32::to_be_bytes(index).to_vec()),
-        }
-    }
-
-    pub fn bitfield(bitfield: &[u8]) -> Self {
-        Self {
-            length: 1 + (bitfield.len() as u32),
-            message_id: Some(MessageIds::BitField),
-            payload: Some(bitfield.to_vec()),
-        }
-    }
-
-    pub fn request(index: u32, begin: u32, length: u32) -> Self {
-        let mut payload: Vec<u8> = Vec::with_capacity(12);
-        payload.extend_from_slice(&u32::to_be_bytes(index));
-        payload.extend_from_slice(&u32::to_be_bytes(begin));
-        payload.extend_from_slice(&u32::to_be_bytes(length));
-        Self {
-            length: 13,
-            message_id: Some(MessageIds::Request),
-            payload: Some(payload),
-        }
-    }
-
-    pub fn piece(index: u32, begin: u32, block: &[u8]) -> Self {
-        let mut payload: Vec<u8> = Vec::with_capacity(12);
-        payload.extend_from_slice(&u32::to_be_bytes(index));
-        payload.extend_from_slice(&u32::to_be_bytes(begin));
-        payload.extend_from_slice(block);
-        Self {
-            length: 9 + block.len() as u32,
-            message_id: Some(MessageIds::Piece),
-            payload: Some(payload),
-        }
-    }
-
-    pub fn cancel(index: u32, begin: u32, length: u32) -> Self {
-        let mut payload: Vec<u8> = Vec::with_capacity(12);
-        payload.extend_from_slice(&u32::to_be_bytes(index));
-        payload.extend_from_slice(&u32::to_be_bytes(begin));
-        payload.extend_from_slice(&u32::to_be_bytes(length));
-        Self {
-            length: 13,
-            message_id: Some(MessageIds::Cancel),
-            payload: Some(payload),
-        }
-    }
-
-    pub fn port(listen_port: u16) -> Self {
-        Self {
-            length: 3,
-            message_id: Some(MessageIds::Port),
-            payload: Some(u16::to_be_bytes(listen_port).to_vec()),
-        }
-    }
+    message_id: Option<MessageId>,
 }
 
 /// Enum representing the type of messages supported by the BitTorrent protocol
 #[repr(u8)]
 #[derive(Debug)]
-enum MessageIds {
+enum MessageId {
     /// Indicates that the peer is choking the client
     Choke = 0,
     /// Indicates that the peer is unchoking the client
@@ -326,4 +262,71 @@ enum MessageIds {
     ///
     /// This peer should be inserted in the local routing table if DHT tracker is supported.
     Port = 9,
+}
+
+impl TryFrom<u8> for MessageId {
+    type Error = ();
+    fn try_from(val: u8) -> Result<Self, Self::Error> {
+        match val {
+            0 => Ok(MessageId::Choke),
+            1 => Ok(MessageId::UnChoke),
+            2 => Ok(MessageId::Interested),
+            3 => Ok(MessageId::NotInterested),
+            4 => Ok(MessageId::Have),
+            5 => Ok(MessageId::BitField),
+            6 => Ok(MessageId::Request),
+            7 => Ok(MessageId::Piece),
+            8 => Ok(MessageId::Cancel),
+            9 => Ok(MessageId::Port),
+            _ => Err(()),
+        }
+    }
+}
+
+struct MessageDecoder {}
+
+const MAX_MESSAGE_LEN: usize = 1 << 16;
+
+impl Decoder for MessageDecoder {
+    type Item = Message;
+    type Error = std::io::Error;
+
+    fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        if src.len() < 4 {
+            // Not enough data to read length marker
+            return Ok(None);
+        }
+
+        let mut length_bytes = [0u8; 4];
+        length_bytes.copy_from_slice(&src[..4]);
+        let length = u32::from_be_bytes(length_bytes);
+        if length == 0 {
+            return Ok(Some(Message {
+                length: 0,
+                message_id: None,
+            }));
+        }
+        if src.len() < 4 + 1 {
+            src.reserve(4 + 1);
+            return Ok(None);
+        }
+
+        if length as usize > MAX_MESSAGE_LEN {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Frame of length {} is too large.", length),
+            ));
+        }
+
+        let Ok(message_id) = MessageId::try_from(src[4]) else {
+            return Err(Self::Error::from(std::io::ErrorKind::Other));
+        };
+
+        src.advance(4 + 1);
+
+        Ok(Some(Message {
+            length,
+            message_id: Some(message_id),
+        }))
+    }
 }
