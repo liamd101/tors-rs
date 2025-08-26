@@ -1,7 +1,7 @@
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer};
 
-use crate::Peer;
+use crate::peer::Peer;
 
 #[allow(dead_code)]
 #[derive(Debug, Deserialize)]

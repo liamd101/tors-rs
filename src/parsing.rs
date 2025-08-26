@@ -1,5 +1,6 @@
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use sha1::{Digest, Sha1};
 use std::fmt;
 
 #[allow(dead_code)]
@@ -49,7 +50,7 @@ pub struct TorrInfo {
 }
 
 #[derive(Debug, Clone)]
-pub struct Hashes(Vec<[u8; 20]>);
+pub struct Hashes(pub Vec<[u8; 20]>);
 struct HashesVisitor;
 
 impl<'de> Visitor<'de> for HashesVisitor {
@@ -105,6 +106,14 @@ pub enum FileTypes {
         files: Vec<File>,
     },
 }
+impl FileTypes {
+    pub fn len(&self) -> u64 {
+        match self {
+            &Self::SingleFile { length } => length as u64,
+            Self::MultiFile { files } => files.iter().map(|f| f.length as u64).sum(),
+        }
+    }
+}
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct File {
@@ -113,4 +122,17 @@ pub struct File {
 
     // A list of UTF-8 encoded strings corresponding to subdirectory names, the last of which is the actual file name (a zero length list is an error case).
     path: Vec<String>,
+}
+
+pub fn hash_string(s: String) -> [u8; 20] {
+    let mut hasher = Sha1::new();
+    hasher.update(s);
+    hasher.finalize().into()
+}
+
+pub fn get_info_hash(info: &crate::parsing::TorrInfo) -> [u8; 20] {
+    let serialized = serde_bencode::to_bytes(info).expect("could not serialize metadata");
+    let mut hasher = Sha1::new();
+    hasher.update(serialized);
+    hasher.finalize().into()
 }
