@@ -1,7 +1,13 @@
+use std::collections::HashMap;
+
+use crate::peer::Peer;
+
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer};
 
-use crate::peer::Peer;
+use anyhow::Result;
+use tokio::net::TcpListener;
+use tracing::error;
 
 #[allow(dead_code)]
 #[derive(Debug, Deserialize)]
@@ -78,4 +84,68 @@ impl<'de> Deserialize<'de> for Peers {
     {
         deserializer.deserialize_bytes(PeersVisitor)
     }
+}
+
+#[allow(dead_code)]
+enum TrackerEvent {
+    Started,
+    Completed,
+    Stopped,
+}
+impl std::fmt::Display for TrackerEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TrackerEvent::Started => write!(f, "started"),
+            TrackerEvent::Completed => write!(f, "completed"),
+            TrackerEvent::Stopped => write!(f, "stopped"),
+        }
+    }
+}
+
+pub fn create_tracker_url(
+    metadata: &crate::parsing::Metadata,
+    listener: TcpListener,
+) -> Result<String, anyhow::Error> {
+    let announce: reqwest::Url = metadata.announce.parse()?;
+    match announce.scheme() {
+        "http" | "https" => {}
+        _ => {
+            error!("invalid scheme");
+            return Err(anyhow::Error::msg("Invalid Scheme".to_string()));
+        }
+    }
+
+    let port = listener.local_addr().expect("getting addr").port();
+    let peer_id = crate::parsing::hash_string("liamdodds11223344556".to_string());
+    let mut params: HashMap<String, String> = HashMap::new();
+    params.insert("port".into(), format!("{port}"));
+    params.insert("event".into(), TrackerEvent::Started.to_string());
+    params.insert("compact".into(), "1".into());
+    params.insert("uploaded".into(), "0".into());
+    params.insert("downloaded".into(), "0".into());
+    params.insert(
+        "peer_id".into(),
+        urlencoding::encode_binary(&peer_id).to_string(),
+    );
+    match metadata.info.torr_type {
+        crate::parsing::FileTypes::SingleFile { length } => {
+            params.insert("left".into(), format!("{length}"));
+        }
+        _ => unimplemented!("don't have support for multiple files yet"),
+    }
+
+    let info_hash = crate::parsing::get_info_hash(&metadata.info);
+    params.insert(
+        "info_hash".into(),
+        urlencoding::encode_binary(&info_hash).to_string(),
+    );
+
+    // what the fuck
+    let params = params
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<String>>()
+        .join("&");
+
+    Ok(format!("{}?{params}", metadata.announce))
 }

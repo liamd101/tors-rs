@@ -1,19 +1,21 @@
 use std::io::SeekFrom;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use rand::seq::IndexedRandom;
 
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::TcpStream;
-use tokio_util::bytes::{Buf, BytesMut};
+use tokio::sync::broadcast::{Receiver, Sender};
+use tokio_util::bytes::BytesMut;
 use tokio_util::codec::{Decoder, Encoder};
 
-use tracing::{Instrument, debug, error, info};
+use tracing::{debug, info};
 
 use crate::{
     message::{BitField, Message, MessageCodec, MessageId},
     parsing::Metadata,
+    ThreadUpdate,
 };
 
 const BLOCK_SIZE: u32 = 1 << 14;
@@ -128,7 +130,7 @@ impl PeerHandshake {
     }
 }
 
-async fn try_handshake(
+pub async fn try_handshake(
     stream: &mut TcpStream,
     handshake: &PeerHandshake,
 ) -> Result<bool, std::io::Error> {
@@ -145,218 +147,230 @@ async fn try_handshake(
     Ok(peer_response.info_hash == handshake.info_hash)
 }
 
+struct Pieces {
+    requested: Vec<Vec<bool>>,
+}
+impl Pieces {
+    pub fn new(num_pieces: usize, num_blocks: usize) -> Self {
+        Self {
+            requested: vec![vec![false; num_blocks]; num_pieces],
+        }
+    }
+
+    pub fn request(&mut self, piece: usize, block: usize) -> Option<bool> {
+        let piece = self.requested.get_mut(piece)?;
+        if piece.len() >= block {
+            None
+        } else {
+            piece[block] = true;
+            Some(true)
+        }
+    }
+}
+
 #[allow(unreachable_code)]
 pub async fn handle_peer(
-    metadata: Metadata,
-    handshake: PeerHandshake,
-    my_bitfield: Arc<BitField>,
+    _tx: Sender<ThreadUpdate>,
+    mut _rx: Receiver<ThreadUpdate>,
     mut stream: TcpStream,
-    peer_addr: std::net::SocketAddr,
+    metadata: Metadata,
+    my_bitfield: Arc<RwLock<BitField>>,
 ) -> Result<(), std::io::Error> {
-    let span = tracing::info_span!("peer", peer_addr = %peer_addr);
-    async move {
-        debug!("handling peer connection");
+    debug!("handling peer connection");
 
-        match try_handshake(&mut stream, &handshake).await {
-            Ok(true) => {}
-            Ok(false) => {
-                info!("peer handshake failed. severing connection");
-                return stream.shutdown().await;
-            }
-            Err(e) => {
-                error!("{e}");
-                info!("peer handshake failed. severing connection");
-                return stream.shutdown().await;
-            }
-        }
+    let mut choked = true;
+    let mut am_interested = false;
 
-        let mut choked = true;
-        let mut am_interested = false;
-        let num_blocks = metadata.info.piece_length / (1 << 14);
-        let num_pieces = (metadata.info.torr_type.len() as usize + metadata.info.piece_length - 1)
-            / metadata.info.piece_length;
-        debug!("num_blocks={num_blocks}");
-        let blocks_vec = (0..num_blocks).collect::<Vec<usize>>();
+    let num_blocks = metadata.info.piece_length / (1 << 14);
+    let blocks_vec = (0..num_blocks).collect::<Vec<usize>>();
 
-        // TODO: this will definitely need to be redone with mrsw design
-        let mut peer_bitfield: Option<BitField> = None;
+    let num_pieces: u64 = metadata.info.torr_type.len();
+    let num_pieces = (num_pieces as usize).div_ceil(metadata.info.piece_length);
 
-        let mut message_codec = MessageCodec {};
-        let mut write_buf = BytesMut::new();
-        let mut requested: Option<(u32, u32)> = None;
+    // TODO: this will definitely need to be redone with mrsw design
+    let mut peer_bitfield = BitField::with_settable(num_pieces);
 
-        loop {
-            let mut read_buf = BytesMut::zeroed(5);
-            stream.read_exact(&mut read_buf).await?;
-            let Some(message) = message_codec.decode(&mut read_buf).expect("invalid read") else {
-                continue;
-            };
-            debug!("message received: {message:?}");
-            let Some(message_id) = message.message_id else {
-                continue;
-            };
+    let mut message_codec = MessageCodec {};
+    let mut write_buf = BytesMut::new();
+    // this should be a Vec<(u32, u32)>
+    // that way we can cancel previous requests that are no longer needed
 
-            match message_id {
-                MessageId::Piece => {
-                    // this probably goes to its own function
-                    info!("peer is sending us piece data");
-                    let piece_index: u32 = stream.read_u32().await?;
-                    let begin: u32 = stream.read_u32().await?;
-                    info!("receiving piece={piece_index} offset={begin}");
-                    /* let filename = format!("{}-{}", metadata.info.name, piece_index); */
-                    let mut file = tokio::fs::File::options()
-                        .create(true)
-                        .write(true)
-                        .truncate(false)
-                        .open(&metadata.info.name)
-                        /* .open(filename) */
-                        .await?;
+    // This is a vector of pieces that have previously been requested
+    let mut _requested: Pieces = Pieces::new(num_pieces, num_blocks);
+    let mut requested: Option<(u32, u32)> = None;
 
-                    let current_len = file.metadata().await?.len();
-                    if current_len != 0 {
-                        file.set_len(metadata.info.torr_type.len()).await?;
-                    }
+    loop {
+        let mut read_buf = BytesMut::zeroed(5);
+        stream.read_exact(&mut read_buf).await?;
+        let Some(message) = message_codec.decode(&mut read_buf).expect("invalid read") else {
+            continue;
+        };
+        debug!("message received: {message:?}");
+        let Some(message_id) = message.message_id else {
+            continue;
+        };
 
-                    let piece_start = piece_index as u64 * metadata.info.piece_length as u64;
-                    file.seek(SeekFrom::Start(piece_start + begin as u64))
-                        .await?;
+        match message_id {
+            MessageId::Piece => {
+                info!("peer is sending us piece data");
+                let piece_index: u32 = stream.read_u32().await?;
+                let begin: u32 = stream.read_u32().await?;
+                info!("receiving piece={piece_index} offset={begin}");
+                let mut file = tokio::fs::File::options()
+                    .create(true)
+                    .write(true)
+                    .truncate(false)
+                    .open(&metadata.info.name)
+                    .await?;
 
-                    let reader = BufReader::new(&mut stream);
-                    let mut writer = BufWriter::new(&mut file);
-                    let mut piece_reader = reader.take(message.length as u64 - 9);
-                    let bytes_copied = tokio::io::copy_buf(&mut piece_reader, &mut writer).await?;
-                    writer.flush().await?;
-                    debug!(
-                        "wrote {bytes_copied} bytes to {}",
-                        piece_start + begin as u64
-                    );
-                    requested = None;
+                let current_len = file.metadata().await?.len();
+                if current_len != 0 {
+                    file.set_len(metadata.info.torr_type.len()).await?;
                 }
 
-                MessageId::BitField => {
-                    if peer_bitfield.is_some() {
-                        // TODO: error handle this case
-                        // BitField message can only be sent once
-                        continue;
-                    }
-                    let mut read_buf = BytesMut::zeroed(message.length as usize - 1);
-                    stream.read_exact(&mut read_buf).await?;
-                    let payload = read_buf.to_vec();
-                    read_buf.advance(message.length as usize - 1);
-                    let bitfield = BitField::new(payload, num_pieces)
-                        .expect("invalid payload and settable bits combo");
-                    peer_bitfield = Some(bitfield);
-                    debug!("bitfield={peer_bitfield:?}");
-                }
+                let piece_start = piece_index as u64 * metadata.info.piece_length as u64;
+                file.seek(SeekFrom::Start(piece_start + begin as u64))
+                    .await?;
 
-                MessageId::Interested => {
-                    // TODO: send message to parent receiver that they are interested in a piece
-                    // from us
-                }
-
-                MessageId::Have => {
-                    let index: u32 = stream.read_u32().await?;
-                    let p_bitfield = peer_bitfield.unwrap_or(BitField::with_settable(num_pieces));
-                    peer_bitfield =
-                        Some(p_bitfield.set(index as usize, true).expect("invalid index"));
-                }
-
-                MessageId::UnChoke => choked = false,
-
-                MessageId::Choke => choked = true,
-
-                _ => continue,
-            }
-
-            debug!("peer_bitfield={peer_bitfield:?}");
-
-            /* If the peer has something that we want, have not sent
-             * the peer an Interested message, send an interested message. */
-            if peer_bitfield.is_some()
-                && my_bitfield
-                    .has_other(peer_bitfield.as_ref().unwrap())
-                    .expect("one of us has incorrect bitfield")
-                && !am_interested
-            /* && !peer.am_interested */
-            {
-                let message = Message {
-                    length: 1,
-                    message_id: Some(MessageId::Interested),
-                };
-                debug!("sending message: {message:?}");
-
-                message_codec.encode(message, &mut write_buf)?;
-                stream.write_all(&write_buf).await?;
-
-                /* peer.am_interested = true; */
-                am_interested = true;
-            }
-
-            if !choked && requested.is_none() {
-                // want to send a single request message
-                info!("peer has piece we want");
-                let message = Message {
-                    length: 13,
-                    message_id: Some(MessageId::Request),
-                };
-                debug!("sending message: {message:?}");
-                message_codec.encode(message, &mut write_buf)?;
-                stream.write_all(&write_buf).await?;
-                // now want to select random piece / block that we do not currently have
-                let piece_options = peer_bitfield.as_ref().unwrap().set_bits();
-                let piece = *piece_options.choose(&mut rand::rng()).unwrap() as u32;
-                let block_num = *blocks_vec.choose(&mut rand::rng()).unwrap() as u32;
-                requested = Some((piece, block_num));
-                let block_size = calculate_block_size(
-                    piece,
-                    block_num,
-                    metadata.info.piece_length,
-                    metadata.info.torr_type.len(),
-                    BLOCK_SIZE,
+                let reader = BufReader::new(&mut stream);
+                let mut writer = BufWriter::new(&mut file);
+                let mut piece_reader = reader.take(message.length as u64 - 9);
+                let bytes_copied = tokio::io::copy_buf(&mut piece_reader, &mut writer).await?;
+                writer.flush().await?;
+                debug!(
+                    "wrote {bytes_copied} bytes to {}",
+                    piece_start + begin as u64
                 );
-                if block_size != BLOCK_SIZE {
-                    // TODO: may need to update block_num
-                }
-
-                let block_begin = block_num * BLOCK_SIZE;
-                info!("requesting piece={piece} block={block_num} length={block_size}");
-                let mut payload = vec![];
-                payload.extend_from_slice(&u32::to_be_bytes(piece));
-                payload.extend_from_slice(&u32::to_be_bytes(block_begin));
-                payload.extend_from_slice(&u32::to_be_bytes(block_size));
-                stream.write_all(&payload).await?;
+                requested = None;
             }
+
+            MessageId::BitField => {
+                let mut payload = vec![0u8; message.length as usize - 1];
+                stream.read_exact(&mut payload).await?;
+                peer_bitfield =
+                    BitField::new(payload, num_pieces).expect("peer has an impossible bitfield");
+                debug!("bitfield={peer_bitfield:?}");
+            }
+
+            MessageId::Interested => {
+                // TODO: send message to parent receiver that they are interested in a piece
+                // from us
+            }
+
+            MessageId::Have => {
+                let index: u32 = stream.read_u32().await?;
+                peer_bitfield
+                    .set(index as usize, true)
+                    .expect("invalid index");
+            }
+
+            MessageId::UnChoke => choked = false,
+
+            MessageId::Choke => choked = true,
+
+            _ => todo!(),
         }
 
-        stream.shutdown().await
+        /* If the peer has something that we want, have not sent
+         * the peer an Interested message, send an interested message. */
+        if my_bitfield
+            .read()
+            .unwrap()
+            .has_other(&peer_bitfield)
+            .expect("one of us has incorrect bitfield")
+            && !am_interested
+        {
+            let message = Message {
+                length: 1,
+                message_id: Some(MessageId::Interested),
+            };
+            debug!("sending message: {message:?}");
+
+            message_codec.encode(message, &mut write_buf)?;
+            stream.write_all(&write_buf).await?;
+
+            am_interested = true;
+        }
+
+        if !my_bitfield
+            .read()
+            .unwrap()
+            .has_other(&peer_bitfield)
+            .expect("one of us has incorrect bitfield")
+        {
+            let message = Message {
+                length: 1,
+                message_id: Some(MessageId::NotInterested),
+            };
+            debug!("sending message: {message:?}");
+
+            message_codec.encode(message, &mut write_buf)?;
+            stream.write_all(&write_buf).await?;
+
+            am_interested = false;
+        }
+
+        if !choked && requested.is_none() {
+            // want to send a single request message
+            info!("peer has piece we want");
+            let message = Message {
+                length: 13,
+                message_id: Some(MessageId::Request),
+            };
+            debug!("sending message: {message:?}");
+            message_codec.encode(message, &mut write_buf)?;
+            stream.write_all(&write_buf).await?;
+            // now want to select random piece / block that we do not currently have
+            let piece_options = peer_bitfield.set_bits();
+            let piece = *piece_options.choose(&mut rand::rng()).unwrap() as u32;
+            let block_num = *blocks_vec.choose(&mut rand::rng()).unwrap() as u32;
+            requested = Some((piece, block_num));
+            let block_size = calculate_block_size(
+                piece,
+                block_num,
+                metadata.info.piece_length as u64,
+                metadata.info.torr_type.len(),
+                BLOCK_SIZE,
+            );
+
+            if block_size != BLOCK_SIZE {
+                // TODO: may need to update block_num
+            }
+
+            let block_begin = block_num * BLOCK_SIZE;
+            info!("requesting piece={piece} block={block_num} length={block_size}");
+            stream.write_u32(piece).await?;
+            stream.write_u32(block_begin).await?;
+            stream.write_u32(block_size).await?;
+        }
     }
-    .instrument(span)
-    .await
+
+    stream.shutdown().await
 }
 
 /// Helper function for computing the correct blocksize for a given piece and block pair
 fn calculate_block_size(
     piece_index: u32,
     block_index: u32,
-    piece_length: usize,
+    piece_length: u64,
     total_file_size: u64,
     block_size: u32,
 ) -> u32 {
-    let total_pieces = ((total_file_size + piece_length as u64 - 1) / piece_length as u64) as u32;
+    let total_pieces = total_file_size.div_ceil(piece_length) as u32;
     let is_last_piece = piece_index == total_pieces - 1;
 
     let actual_piece_size = if is_last_piece {
-        let last_piece_size = total_file_size % piece_length as u64;
+        let last_piece_size = total_file_size % piece_length;
         if last_piece_size == 0 {
-            piece_length as u64
+            piece_length
         } else {
             last_piece_size
         }
     } else {
-        piece_length as u64
+        piece_length
     };
 
-    let blocks_in_piece = (actual_piece_size + block_size as u64 - 1) / block_size as u64;
+    let blocks_in_piece = actual_piece_size.div_ceil(block_size as u64);
     let is_last_block = block_index == blocks_in_piece as u32 - 1;
 
     if is_last_block {

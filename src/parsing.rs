@@ -113,6 +113,10 @@ impl FileTypes {
             Self::MultiFile { files } => files.iter().map(|f| f.length as u64).sum(),
         }
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]

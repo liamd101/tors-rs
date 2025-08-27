@@ -1,26 +1,27 @@
-use sha1::{Digest, Sha1};
-use std::collections::HashMap;
 use std::io::SeekFrom;
 use std::path::PathBuf;
-use std::sync::Arc;
-
-use clap::Parser;
-
-use tokio::fs::File;
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
-use tokio::task::JoinSet;
+use std::sync::{Arc, RwLock};
 
 use tors_rs::{
+    ThreadUpdate,
     message::BitField,
-    parsing::{Hashes, Metadata},
-    peer::{PeerHandshake, handle_peer},
-    tracker::TrackerResponse,
+    parsing::{self, Hashes, Metadata},
+    peer::{PeerHandshake, handle_peer, try_handshake},
+    tracker::{TrackerResponse, create_tracker_url},
 };
 
-use tracing::{debug, error, info};
-use tracing_subscriber::{self, EnvFilter};
-
 use anyhow::Result;
+use clap::Parser;
+use sha1::{Digest, Sha1};
+use tokio::{
+    fs::File,
+    io::{AsyncReadExt, AsyncSeekExt},
+    net::TcpListener,
+    sync::broadcast,
+    task::JoinSet,
+};
+use tracing::{Instrument, debug, error, info, warn};
+use tracing_subscriber::{self, EnvFilter};
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -29,6 +30,16 @@ struct Args {
 
     #[arg(short, long, required = true)]
     file: String,
+}
+
+async fn find_open_port() -> Result<TcpListener, std::io::Error> {
+    for port_num in 6881..=6889 {
+        match TcpListener::bind(format!("127.0.0.1:{port_num}")).await {
+            Ok(out) => return Ok(out),
+            Err(_) => continue,
+        }
+    }
+    Err(std::io::Error::other("unable to find open port"))
 }
 
 #[tokio::main]
@@ -44,47 +55,11 @@ async fn main() {
 
     let data: &[u8] = &std::fs::read(torr_path).expect("file does not exist");
     let metadata: Metadata = serde_bencode::from_bytes(data).expect("unable to parse file");
-    let announce: reqwest::Url = metadata.announce.parse().expect("unable to parse announce");
-    match announce.scheme() {
-        "http" | "https" => {}
-        _ => {
-            error!("invalid scheme");
-            return;
-        }
-    }
+    let info_hash = parsing::get_info_hash(&metadata.info);
+    let peer_id = parsing::hash_string("liamdodds11223344556".to_string());
 
-    let port = 6969;
-    let peer_id = tors_rs::parsing::hash_string("liamdodds11223344556".to_string());
-    let mut params: HashMap<String, String> = HashMap::new();
-    params.insert("port".into(), format!("{port}"));
-    params.insert("event".into(), "started".into());
-    params.insert("compact".into(), "1".into());
-    params.insert("uploaded".into(), "0".into());
-    params.insert("downloaded".into(), "0".into());
-    params.insert(
-        "peer_id".into(),
-        urlencoding::encode_binary(&peer_id).to_string(),
-    );
-    match metadata.info.torr_type {
-        tors_rs::parsing::FileTypes::SingleFile { length } => {
-            params.insert("left".into(), format!("{length}"));
-        }
-        _ => unimplemented!("don't have support for multiple files yet"),
-    }
-
-    let info_hash = tors_rs::parsing::get_info_hash(&metadata.info);
-    params.insert(
-        "info_hash".into(),
-        urlencoding::encode_binary(&info_hash).to_string(),
-    );
-
-    // what the fuck
-    let params = params
-        .iter()
-        .map(|(k, v)| format!("{k}={v}"))
-        .collect::<Vec<String>>()
-        .join("&");
-    let announce = format!("{announce}?{params}");
+    let listener: TcpListener = find_open_port().await.expect("unable to find open port");
+    let announce = create_tracker_url(&metadata, listener).expect("valid tracker URL");
 
     // let announce = reqwest::Url::parse_with_params(announce.as_str(), params).expect("unable to create tracker URL");
     let res = reqwest::get(announce).await.expect("invalid tracker URL");
@@ -100,45 +75,84 @@ async fn main() {
     };
     debug!("tracker supplied {} peers", peers.len());
     // now to connect to a peer
+    let num_pieces: usize =
+        (metadata.info.torr_type.len() as usize).div_ceil(metadata.info.piece_length);
+    let my_bitfield = Arc::new(RwLock::new(BitField::with_settable(num_pieces)));
 
     // want to make bitfield from our file
-    let my_download = Download::new(
+    let mut my_download = Download::new(
         metadata.info.name.clone(),
         metadata.info.pieces.clone(),
         metadata.info.torr_type.len(),
         metadata.info.piece_length as u64,
+        my_bitfield.clone(),
     )
     .await
     .expect("couldn't create download struct");
-    debug!("my_download={my_download:?}");
 
     if my_download.is_downloaded() {
         info!("file is downloaded already!!");
         return;
     }
 
-    let my_bitfield = Arc::new(my_download.bitfield);
-
-    let handshake = PeerHandshake::v1(info_hash, peer_id);
-
-    // TODO: maybe specify a limit of peers we can connect to at once?
     let mut set = JoinSet::new();
+    let (tx, mut rx1) = broadcast::channel::<ThreadUpdate>(4);
 
-    // TODO: this should probably use threads to download files in parallel
+    let tx2 = tx.clone();
+    set.spawn(async move {
+        loop {
+            match rx1.recv().await.unwrap() {
+                ThreadUpdate::Downloaded(_piece, _block) => {
+                    let changed = my_download
+                        .update_downloads()
+                        .await
+                        .expect("couldn't update download state");
+                    for changed_piece in changed {
+                        tx2.send(ThreadUpdate::Completed(changed_piece))
+                            .expect("couldn't send");
+                    }
+                    if my_download.is_downloaded() {
+                        break;
+                    }
+                }
+                ThreadUpdate::Completed(_piece) => continue,
+            }
+        }
+    });
+
     for peer in &peers {
-        let stream = tokio::net::TcpStream::connect(peer.socket_addr)
+        let span = tracing::info_span!("peer", peer_addr = %peer.socket_addr);
+
+        let mut stream = tokio::net::TcpStream::connect(peer.socket_addr)
             .await
             .expect("couldn't connect to peer");
 
         let metadata = metadata.clone();
-        let handshake = handshake.clone();
-        let peer_addr = peer.socket_addr;
+        let handshake = PeerHandshake::v1(info_hash, peer_id);
         let my_bitfield = my_bitfield.clone();
 
+        match try_handshake(&mut stream, &handshake).await {
+            Ok(true) => {}
+            Ok(false) => {
+                warn!("peer failed the handshake. trying another peer instead");
+                continue;
+            }
+            Err(e) => {
+                error!("{e}");
+                continue;
+            }
+        }
+
+        let thread_tx = tx.clone();
+        let thread_rx = tx.subscribe();
+
         set.spawn(async move {
-            match handle_peer(metadata, handshake, my_bitfield, stream, peer_addr).await {
+            match handle_peer(thread_tx, thread_rx, stream, metadata, my_bitfield)
+                .instrument(span)
+                .await
+            {
                 Ok(()) => {}
-                Err(e) => error!("handle_peer {peer_addr}: {e}"),
+                Err(e) => error!("{e}"),
             }
         });
     }
@@ -159,7 +173,7 @@ struct Download {
     piece_hashes: Hashes,
     /// A BitField of the currently downloaded pieces. Read from left-to-right with a 1 set if the
     /// piece is downloaded and verified. 0 otherwise
-    bitfield: tors_rs::message::BitField,
+    bitfield: Arc<RwLock<BitField>>,
 }
 
 impl Download {
@@ -169,10 +183,10 @@ impl Download {
         piece_hashes: Hashes,
         length: u64,
         piece_length: u64,
+        bitfield: Arc<RwLock<BitField>>,
     ) -> Result<Self, std::io::Error> {
         let name = PathBuf::from(name);
-        let num_pieces: usize = ((length + piece_length - 1) / piece_length) as usize;
-        let bitfield: BitField = BitField::with_settable(num_pieces);
+        let num_pieces = length.div_ceil(piece_length) as usize;
         let mut out = Self {
             name,
             piece_length,
@@ -186,12 +200,12 @@ impl Download {
     }
 
     pub fn is_downloaded(&self) -> bool {
-        self.bitfield.set_bits().len() == self.num_pieces
+        self.bitfield.read().unwrap().set_bits().len() == self.num_pieces
     }
 
     /// Iterates through all pieces of the file, computes their SHA1 hash, and then sets their
     /// correspondign bits in the BitField to true/false accordingly
-    pub async fn update_downloads(&mut self) -> Result<(), std::io::Error> {
+    pub async fn update_downloads(&mut self) -> Result<Vec<usize>, std::io::Error> {
         let mut file: File = tokio::fs::File::options()
             .read(true)
             .write(true)
@@ -202,17 +216,20 @@ impl Download {
 
         if file.metadata().await?.len() == 0 {
             file.set_len(self.length).await?;
-            return Ok(()); /* no need to check pieces since the file has not been written to */
+            return Ok(vec![]); /* no need to check pieces since the file has not been written to */
         }
 
+        let mut changed = vec![];
+
         for piece in 0..self.num_pieces {
-            let piece_len = if piece == (self.num_pieces - 1) as usize {
+            let piece_len = if piece == (self.num_pieces - 1) {
                 self.length % self.piece_length
             } else {
                 self.piece_length
             };
             let mut piece_data: Vec<u8> = vec![0u8; piece_len as usize];
-            file.seek(SeekFrom::Start(self.piece_length * piece as u64)).await?;
+            file.seek(SeekFrom::Start(self.piece_length * piece as u64))
+                .await?;
             file.read_exact(&mut piece_data).await?;
 
             let mut hasher = Sha1::new();
@@ -221,14 +238,19 @@ impl Download {
             let hash: [u8; 20] = self.piece_hashes.0[piece];
 
             let finished_download: bool = piece_hash == hash;
-            debug!("checking piece={piece}");
-            debug!("downloaded_hash ={piece_hash:?}");
-            debug!("tracker    hash ={piece_hash:?}");
-            self.bitfield = self.bitfield
+
+            let prev = self
+                .bitfield
+                .write()
+                .unwrap()
                 .set(piece, finished_download)
                 .expect("index out of bounds");
+
+            if finished_download && !prev {
+                changed.push(piece);
+            }
         }
 
-        Ok(())
+        Ok(changed)
     }
 }

@@ -3,7 +3,7 @@ use tokio_util::codec::{Decoder, Encoder};
 
 use tracing::error;
 
-use anyhow::{Error, Result};
+use anyhow::Result;
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct BitField {
@@ -52,7 +52,7 @@ impl BitField {
     pub fn with_settable(settable: usize) -> Self {
         Self {
             settable,
-            bits: vec![0u8; (settable + 8 - 1) / 8], /* computes the number of bytes necessary for the required number of bits */
+            bits: vec![0u8; settable.div_ceil(8)], /* computes the number of bytes necessary for the required number of bits */
         }
     }
 
@@ -69,23 +69,23 @@ impl BitField {
         Ok(self.bits[byte_index] & mask != 0)
     }
 
-    pub fn set(&self, index: usize, value: bool) -> Result<Self, &'static str> {
+    pub fn set(&mut self, index: usize, value: bool) -> Result<bool, &'static str> {
         if index > self.settable {
             return Err("Index out of bounds");
         }
-        let mut out = self.clone();
         let byte_index = index / 8;
         let bit_index = index % 8;
-        if byte_index >= out.bits.len() {
+        if byte_index >= self.bits.len() {
             return Err("Index out of bounds");
         }
         let mask = 1 << (7 - bit_index);
+        let prev = (self.bits[byte_index] & mask) == mask;
         if value {
-            out.bits[byte_index] |= mask;
+            self.bits[byte_index] |= mask;
         } else {
-            out.bits[byte_index] &= !mask;
+            self.bits[byte_index] &= !mask;
         }
-        Ok(out)
+        Ok(prev)
     }
 
     /// Determines if another set has any bits set that `self` does not have set
@@ -147,7 +147,19 @@ impl std::ops::Not for BitField {
     type Output = Self;
 
     fn not(self) -> Self::Output {
-        todo!()
+        let mut bits = self.bits.clone();
+        for (i, &byte) in self.bits.iter().enumerate() {
+            if i == self.bits.len() - 1 {
+                let mut mask = 0u8;
+                for b in 0..self.settable % 8 {
+                    mask |= 0b10000000 >> b;
+                }
+                bits.push(mask);
+            } else {
+                bits.push(!byte);
+            }
+        }
+        BitField::new(bits, self.settable).expect("this should never fail")
     }
 }
 
