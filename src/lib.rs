@@ -3,7 +3,6 @@ pub mod parsing;
 pub mod peer;
 pub mod tracker;
 
-
 #[derive(Clone, Debug)]
 /// Enum representing some messages that get sent between peer threads and parent threads.
 pub enum ThreadUpdate {
@@ -12,9 +11,9 @@ pub enum ThreadUpdate {
     /// Sent from peer threads after successfully reading a block from a peer.
     /// Upon receiving this message, the parent thread checks if the any new pieces have been
     /// successfully downloaded.
-    Downloaded(usize, usize),
+    Downloaded(u32, u32),
     /// Indicates that the inner piece has been successfully downloaded, as confirmed by the parent
     /// thread computing the downloaded piece hash and comparing against the piece hash that is
     /// present in the `.torrent` file.
-    Completed(usize),
+    Completed(u32),
 }

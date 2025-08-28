@@ -4,18 +4,21 @@ use std::sync::{Arc, RwLock};
 
 use rand::seq::IndexedRandom;
 
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader, BufWriter};
+use anyhow::{Context, Error};
+
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::broadcast::{Receiver, Sender};
+use tokio::task::JoinSet;
 use tokio_util::bytes::BytesMut;
 use tokio_util::codec::{Decoder, Encoder};
 
-use tracing::{debug, info};
+use tracing::{Instrument, debug, error, info, warn};
 
 use crate::{
+    ThreadUpdate,
     message::{BitField, Message, MessageCodec, MessageId},
     parsing::Metadata,
-    ThreadUpdate,
 };
 
 const BLOCK_SIZE: u32 = 1 << 14;
@@ -147,61 +150,259 @@ pub async fn try_handshake(
     Ok(peer_response.info_hash == handshake.info_hash)
 }
 
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BlockState {
+    UnRequested,
+    Requested,
+    Completed,
+}
+
+#[allow(dead_code)]
 struct Pieces {
-    requested: Vec<Vec<bool>>,
+    num_total_blocks: usize,
+    num_requested: usize,
+    num_downloaded: usize,
+    request_limit: usize,
+    blocks: Vec<Vec<BlockState>>,
 }
 impl Pieces {
+    pub fn from_file_info(file_length: u64, piece_length: u64) -> Self {
+        let num_pieces = file_length.div_ceil(piece_length);
+        let last_piece_begin = (num_pieces - 1) * piece_length;
+        let last_piece_size = file_length - last_piece_begin;
+        let last_piece_num_blocks = last_piece_size.div_ceil(BLOCK_SIZE as u64);
+        let standard_num_blocks = piece_length.div_ceil(BLOCK_SIZE as u64);
+        let mut blocks = vec![
+            vec![BlockState::UnRequested; standard_num_blocks as usize];
+            num_pieces as usize - 1
+        ];
+        blocks.push(vec![
+            BlockState::UnRequested;
+            last_piece_num_blocks as usize
+        ]);
+        Self {
+            num_requested: 0,
+            num_downloaded: 0,
+            request_limit: 3,
+            num_total_blocks: ((num_pieces - 1) * standard_num_blocks + last_piece_num_blocks)
+                as usize,
+            blocks,
+        }
+    }
+
     pub fn new(num_pieces: usize, num_blocks: usize) -> Self {
         Self {
-            requested: vec![vec![false; num_blocks]; num_pieces],
+            num_requested: 0,
+            num_downloaded: 0,
+            request_limit: 3,
+            num_total_blocks: num_pieces * num_blocks,
+            blocks: vec![vec![BlockState::UnRequested; num_blocks]; num_pieces],
         }
     }
 
     pub fn request(&mut self, piece: usize, block: usize) -> Option<bool> {
-        let piece = self.requested.get_mut(piece)?;
+        let piece = self.blocks.get_mut(piece)?;
         if piece.len() >= block {
             None
         } else {
-            piece[block] = true;
+            piece[block] = BlockState::Requested;
+            self.num_requested += 1;
             Some(true)
         }
+    }
+
+    pub fn finish_request(&mut self, piece: usize, block: usize) -> Option<bool> {
+        let piece = self.blocks.get_mut(piece)?;
+        if piece.len() >= block {
+            None
+        } else {
+            if piece[block] == BlockState::Requested {
+                self.num_requested -= 1;
+            }
+            piece[block] = BlockState::Completed;
+            Some(true)
+        }
+    }
+
+    pub fn request_new(&mut self, pieces: Vec<usize>) -> Option<(u32, u32)> {
+        if self.num_requested >= self.request_limit {
+            return None;
+        }
+        // want to create a Vec<(usize, usize)> where first index is in pieces and select randomly from there
+        let blocks: Vec<Vec<BlockState>> = pieces
+            .iter()
+            .map(|&piece_idx| self.blocks[piece_idx].clone())
+            .collect();
+        let blocks: Vec<Vec<usize>> = blocks
+            .iter()
+            .map(|piece| {
+                piece
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(block_idx, block_state)| match block_state {
+                        BlockState::UnRequested => Some(block_idx),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .collect();
+        let blocks: Vec<(u32, u32)> = blocks
+            .iter()
+            .enumerate()
+            .flat_map(|(piece_idx, piece)| {
+                piece
+                    .iter()
+                    .map(move |&block_idx| (piece_idx as u32, block_idx as u32))
+            })
+            .collect();
+        let out = blocks.choose(&mut rand::rng()).copied()?;
+        self.blocks[out.0 as usize][out.1 as usize] = BlockState::Requested;
+        self.num_requested += 1;
+        Some(out)
+    }
+
+    pub fn complete_piece(&mut self, piece: u32) -> Option<bool> {
+        let piece = self.blocks.get_mut(piece as usize)?;
+        for block in piece.iter_mut() {
+            if block == &BlockState::Requested {
+                self.num_requested -= 1;
+            }
+            *block = BlockState::Completed;
+        }
+        Some(true)
     }
 }
 
 #[allow(unreachable_code)]
 pub async fn handle_peer(
-    _tx: Sender<ThreadUpdate>,
+    tx: Sender<ThreadUpdate>,
     mut _rx: Receiver<ThreadUpdate>,
-    mut stream: TcpStream,
+    stream: TcpStream,
     metadata: Metadata,
     my_bitfield: Arc<RwLock<BitField>>,
 ) -> Result<(), std::io::Error> {
     debug!("handling peer connection");
 
-    let mut choked = true;
-    let mut am_interested = false;
-
-    let num_blocks = metadata.info.piece_length / (1 << 14);
-    let blocks_vec = (0..num_blocks).collect::<Vec<usize>>();
-
-    let num_pieces: u64 = metadata.info.torr_type.len();
-    let num_pieces = (num_pieces as usize).div_ceil(metadata.info.piece_length);
+    let num_pieces: u64 = metadata
+        .info
+        .torr_type
+        .len()
+        .div_ceil(metadata.info.piece_length);
 
     // TODO: this will definitely need to be redone with mrsw design
-    let mut peer_bitfield = BitField::with_settable(num_pieces);
+    let peer_bitfield = Arc::new(RwLock::new(BitField::with_settable(num_pieces)));
+    let choked = Arc::new(RwLock::new(true));
+
+    let (read_stream, write_stream) = tokio::io::split(stream);
+
+    let mut set = JoinSet::new();
+
+    let current_span = tracing::Span::current();
+
+    let read_tx = tx.clone();
+    let read_rx = tx.subscribe();
+    let read_metadata = metadata.clone();
+    let read_choked = choked.clone();
+    let read_peer_bitfield = peer_bitfield.clone();
+    set.spawn(async move {
+        match read_peer(
+            read_tx,
+            read_rx,
+            read_stream,
+            read_metadata,
+            read_peer_bitfield,
+            read_choked,
+        )
+        .instrument(current_span)
+        .await
+        {
+            Ok(stream) => Ok(stream),
+            Err(e) => {
+                error!("{e}");
+                Err(e)
+            }
+        }
+    });
+
+    let current_span = tracing::Span::current();
+    let write_tx = tx.clone();
+    let write_rx = tx.subscribe();
+    let write_metadata = metadata.clone();
+    let write_bitfield = my_bitfield.clone();
+    let write_choked = choked.clone();
+    let write_peer_bitfield = peer_bitfield.clone();
+    set.spawn(async move {
+        match write_peer(
+            write_tx,
+            write_rx,
+            write_stream,
+            write_metadata,
+            write_bitfield,
+            write_peer_bitfield,
+            write_choked,
+        )
+        .instrument(current_span)
+        .await
+        {
+            Ok(stream) => Ok(stream),
+            Err(e) => {
+                error!("{e}");
+                Err(e)
+            }
+        }
+    });
+
+    let mut read_stream: Option<tokio::io::ReadHalf<TcpStream>> = None;
+    let mut write_stream: Option<tokio::io::WriteHalf<TcpStream>> = None;
+
+    while let Some(result) = set.join_next().await {
+        if let Ok(Ok(stream)) = result {
+            match stream {
+                SplitStream::Write(stream) => write_stream = Some(stream),
+                SplitStream::Read(stream) => read_stream = Some(stream),
+            }
+        }
+    }
+
+    if let (Some(read), Some(write)) = (read_stream, write_stream) {
+        let mut stream = read.unsplit(write);
+        stream.shutdown().await
+    } else {
+        Err(std::io::Error::other("Read/Write thread failed"))
+    }
+}
+
+enum SplitStream {
+    Read(tokio::io::ReadHalf<TcpStream>),
+    Write(tokio::io::WriteHalf<TcpStream>),
+}
+
+#[allow(unreachable_code)]
+async fn read_peer(
+    tx: Sender<ThreadUpdate>,
+    mut _rx: Receiver<ThreadUpdate>,
+    mut stream: tokio::io::ReadHalf<TcpStream>,
+    metadata: Metadata,
+    peer_bitfield: Arc<RwLock<BitField>>,
+    choked: Arc<RwLock<bool>>,
+) -> Result<SplitStream, Error> {
+    let num_pieces = metadata
+        .info
+        .torr_type
+        .len()
+        .div_ceil(metadata.info.piece_length);
 
     let mut message_codec = MessageCodec {};
-    let mut write_buf = BytesMut::new();
     // this should be a Vec<(u32, u32)>
     // that way we can cancel previous requests that are no longer needed
 
-    // This is a vector of pieces that have previously been requested
-    let mut _requested: Pieces = Pieces::new(num_pieces, num_blocks);
-    let mut requested: Option<(u32, u32)> = None;
-
     loop {
         let mut read_buf = BytesMut::zeroed(5);
-        stream.read_exact(&mut read_buf).await?;
+        stream
+            .read_exact(&mut read_buf)
+            .await
+            .context("reading message header")?;
         let Some(message) = message_codec.decode(&mut read_buf).expect("invalid read") else {
             continue;
         };
@@ -213,42 +414,50 @@ pub async fn handle_peer(
         match message_id {
             MessageId::Piece => {
                 info!("peer is sending us piece data");
-                let piece_index: u32 = stream.read_u32().await?;
-                let begin: u32 = stream.read_u32().await?;
+                let piece_index: u32 = stream.read_u32().await.context("reading piece index")?;
+                let begin: u32 = stream.read_u32().await.context("reading block offset")?;
                 info!("receiving piece={piece_index} offset={begin}");
                 let mut file = tokio::fs::File::options()
                     .create(true)
                     .write(true)
                     .truncate(false)
                     .open(&metadata.info.name)
-                    .await?;
+                    .await
+                    .context("opening output file")?;
 
                 let current_len = file.metadata().await?.len();
                 if current_len != 0 {
                     file.set_len(metadata.info.torr_type.len()).await?;
                 }
 
-                let piece_start = piece_index as u64 * metadata.info.piece_length as u64;
+                let piece_start = piece_index as u64 * metadata.info.piece_length;
                 file.seek(SeekFrom::Start(piece_start + begin as u64))
                     .await?;
 
-                let reader = BufReader::new(&mut stream);
-                let mut writer = BufWriter::new(&mut file);
-                let mut piece_reader = reader.take(message.length as u64 - 9);
-                let bytes_copied = tokio::io::copy_buf(&mut piece_reader, &mut writer).await?;
-                writer.flush().await?;
-                debug!(
-                    "wrote {bytes_copied} bytes to {}",
-                    piece_start + begin as u64
-                );
-                requested = None;
+                let mut piece_data = vec![0u8; message.length as usize - 9];
+                let bytes_read = stream
+                    .read_exact(&mut piece_data)
+                    .await
+                    .context("reading piece data")?;
+                file.write_all(&piece_data)
+                    .await
+                    .context("writing piece data to file")?;
+
+                debug!("wrote {bytes_read} bytes to {}", piece_start + begin as u64);
+
+                tx.send(ThreadUpdate::Downloaded(piece_index, begin / BLOCK_SIZE))?;
             }
 
             MessageId::BitField => {
                 let mut payload = vec![0u8; message.length as usize - 1];
                 stream.read_exact(&mut payload).await?;
-                peer_bitfield =
+                let sent_bitfield =
                     BitField::new(payload, num_pieces).expect("peer has an impossible bitfield");
+                peer_bitfield
+                    .write()
+                    .unwrap()
+                    .update(&sent_bitfield)
+                    .context("updating peer bitfield from sent")?;
                 debug!("bitfield={peer_bitfield:?}");
             }
 
@@ -260,23 +469,83 @@ pub async fn handle_peer(
             MessageId::Have => {
                 let index: u32 = stream.read_u32().await?;
                 peer_bitfield
+                    .write()
+                    .unwrap()
                     .set(index as usize, true)
                     .expect("invalid index");
             }
 
-            MessageId::UnChoke => choked = false,
+            MessageId::UnChoke => {
+                *choked.write().unwrap() = false;
+            }
 
-            MessageId::Choke => choked = true,
+            MessageId::Choke => *choked.write().unwrap() = true,
 
             _ => todo!(),
         }
+    }
+    Ok(SplitStream::Read(stream))
+}
 
+#[allow(unreachable_code)]
+async fn write_peer(
+    _tx: Sender<ThreadUpdate>,
+    mut rx: Receiver<ThreadUpdate>,
+    mut stream: tokio::io::WriteHalf<TcpStream>,
+    metadata: Metadata,
+    my_bitfield: Arc<RwLock<BitField>>,
+    peer_bitfield: Arc<RwLock<BitField>>,
+    choked: Arc<RwLock<bool>>,
+) -> Result<SplitStream, Error> {
+    let mut am_interested = false;
+
+    let mut message_codec = MessageCodec {};
+    let mut write_buf = BytesMut::new();
+
+    // TODO: support `update(&BitField)`
+    let mut requested: Pieces =
+        Pieces::from_file_info(metadata.info.torr_type.len(), metadata.info.piece_length);
+
+    loop {
+        match rx.try_recv() {
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {}
+            Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
+                todo!()
+            }
+            Ok(ThreadUpdate::Downloaded(piece, block)) => {
+                match requested.finish_request(piece as usize, block as usize) {
+                    Some(_) => debug!("updated requested pieces"),
+                    None => warn!("unable to process piece={piece} block={block}"),
+                }
+            }
+            Ok(ThreadUpdate::Completed(piece)) => {
+                requested.complete_piece(piece);
+                let message = Message {
+                    length: 1,
+                    message_id: Some(MessageId::Have),
+                };
+                debug!("sending message: {message:?}");
+
+                message_codec.encode(message, &mut write_buf)?;
+                stream
+                    .write_all(&write_buf)
+                    .await
+                    .context("writing Interested message")?;
+                stream
+                    .write_u32(piece)
+                    .await
+                    .context("writing Have payload")?;
+            }
+        }
+
+        let choked = *choked.read().unwrap();
         /* If the peer has something that we want, have not sent
          * the peer an Interested message, send an interested message. */
         if my_bitfield
             .read()
             .unwrap()
-            .has_other(&peer_bitfield)
+            .has_other(&peer_bitfield.read().unwrap())
             .expect("one of us has incorrect bitfield")
             && !am_interested
         {
@@ -287,7 +556,10 @@ pub async fn handle_peer(
             debug!("sending message: {message:?}");
 
             message_codec.encode(message, &mut write_buf)?;
-            stream.write_all(&write_buf).await?;
+            stream
+                .write_all(&write_buf)
+                .await
+                .context("writing Interested message")?;
 
             am_interested = true;
         }
@@ -295,8 +567,9 @@ pub async fn handle_peer(
         if !my_bitfield
             .read()
             .unwrap()
-            .has_other(&peer_bitfield)
+            .has_other(&peer_bitfield.read().unwrap())
             .expect("one of us has incorrect bitfield")
+            && am_interested
         {
             let message = Message {
                 length: 1,
@@ -305,47 +578,52 @@ pub async fn handle_peer(
             debug!("sending message: {message:?}");
 
             message_codec.encode(message, &mut write_buf)?;
-            stream.write_all(&write_buf).await?;
+            stream
+                .write_all(&write_buf)
+                .await
+                .context("writing NotInterested message")?;
 
             am_interested = false;
         }
 
-        if !choked && requested.is_none() {
+        let peer_has = peer_bitfield.read().unwrap().set_bits();
+        if !choked && let Some((piece, block_num)) = requested.request_new(peer_has) {
             // want to send a single request message
-            info!("peer has piece we want");
             let message = Message {
                 length: 13,
                 message_id: Some(MessageId::Request),
             };
             debug!("sending message: {message:?}");
             message_codec.encode(message, &mut write_buf)?;
-            stream.write_all(&write_buf).await?;
+            stream
+                .write_all(&write_buf)
+                .await
+                .context("writing Request header")?;
             // now want to select random piece / block that we do not currently have
-            let piece_options = peer_bitfield.set_bits();
-            let piece = *piece_options.choose(&mut rand::rng()).unwrap() as u32;
-            let block_num = *blocks_vec.choose(&mut rand::rng()).unwrap() as u32;
-            requested = Some((piece, block_num));
             let block_size = calculate_block_size(
                 piece,
                 block_num,
-                metadata.info.piece_length as u64,
+                metadata.info.piece_length,
                 metadata.info.torr_type.len(),
-                BLOCK_SIZE,
             );
-
-            if block_size != BLOCK_SIZE {
-                // TODO: may need to update block_num
-            }
 
             let block_begin = block_num * BLOCK_SIZE;
             info!("requesting piece={piece} block={block_num} length={block_size}");
-            stream.write_u32(piece).await?;
-            stream.write_u32(block_begin).await?;
-            stream.write_u32(block_size).await?;
+            stream
+                .write_u32(piece)
+                .await
+                .context("writing piece number")?;
+            stream
+                .write_u32(block_begin)
+                .await
+                .context("writing byte offset")?;
+            stream
+                .write_u32(block_size)
+                .await
+                .context("writing block_size")?;
         }
     }
-
-    stream.shutdown().await
+    Ok(SplitStream::Write(stream))
 }
 
 /// Helper function for computing the correct blocksize for a given piece and block pair
@@ -354,7 +632,6 @@ fn calculate_block_size(
     block_index: u32,
     piece_length: u64,
     total_file_size: u64,
-    block_size: u32,
 ) -> u32 {
     let total_pieces = total_file_size.div_ceil(piece_length) as u32;
     let is_last_piece = piece_index == total_pieces - 1;
@@ -370,17 +647,17 @@ fn calculate_block_size(
         piece_length
     };
 
-    let blocks_in_piece = actual_piece_size.div_ceil(block_size as u64);
+    let blocks_in_piece = actual_piece_size.div_ceil(BLOCK_SIZE as u64);
     let is_last_block = block_index == blocks_in_piece as u32 - 1;
 
     if is_last_block {
-        let remaining_bytes = actual_piece_size % block_size as u64;
+        let remaining_bytes = actual_piece_size % BLOCK_SIZE as u64;
         if remaining_bytes == 0 {
-            block_size
+            BLOCK_SIZE
         } else {
             remaining_bytes as u32
         }
     } else {
-        block_size
+        BLOCK_SIZE
     }
 }

@@ -75,8 +75,11 @@ async fn main() {
     };
     debug!("tracker supplied {} peers", peers.len());
     // now to connect to a peer
-    let num_pieces: usize =
-        (metadata.info.torr_type.len() as usize).div_ceil(metadata.info.piece_length);
+    let num_pieces = metadata
+        .info
+        .torr_type
+        .len()
+        .div_ceil(metadata.info.piece_length);
     let my_bitfield = Arc::new(RwLock::new(BitField::with_settable(num_pieces)));
 
     // want to make bitfield from our file
@@ -102,13 +105,15 @@ async fn main() {
     set.spawn(async move {
         loop {
             match rx1.recv().await.unwrap() {
-                ThreadUpdate::Downloaded(_piece, _block) => {
+                ThreadUpdate::Downloaded(piece, block) => {
+                    debug!("downloaded piece={piece} block={block}");
                     let changed = my_download
                         .update_downloads()
                         .await
                         .expect("couldn't update download state");
+                    debug!("changed pieces={changed:?}");
                     for changed_piece in changed {
-                        tx2.send(ThreadUpdate::Completed(changed_piece))
+                        tx2.send(ThreadUpdate::Completed(changed_piece as u32))
                             .expect("couldn't send");
                     }
                     if my_download.is_downloaded() {
@@ -155,6 +160,7 @@ async fn main() {
                 Err(e) => error!("{e}"),
             }
         });
+        break;
     }
 
     while set.join_next().await.is_some() {}

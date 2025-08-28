@@ -10,13 +10,13 @@ pub struct BitField {
     /// The actual value of the BitField. Stored as `Vec<u8>` since these BitFields can be anylength
     bits: Vec<u8>,
     /// The number of valid/settable bits
-    settable: usize,
+    pub settable: u64,
 }
 impl BitField {
-    pub fn new(bytes: Vec<u8>, settable: usize) -> Result<Self, &'static str> {
-        if settable > 8 * bytes.len() {
+    pub fn new(bytes: Vec<u8>, settable: u64) -> Result<Self, &'static str> {
+        if settable as usize > 8 * bytes.len() {
             return Err("not enough bytes supplied in bitfield");
-        } else if settable < bytes.len() / 8 {
+        } else if (settable as usize) < bytes.len() / 8 {
             return Err("not enough settable bytes");
         }
         let mut ones = 0;
@@ -30,7 +30,7 @@ impl BitField {
             }
         }
 
-        if furthest_left >= settable || ones > settable {
+        if furthest_left >= settable as usize || ones > settable {
             error!("furthest_left={furthest_left}");
             error!("settable={settable}");
             return Err("too many ones set in bitfield");
@@ -42,22 +42,34 @@ impl BitField {
         })
     }
 
+    pub fn update(&mut self, other: &Self) -> Result<(), std::io::Error> {
+        if self.settable != other.settable {
+            return Err(std::io::Error::other("Number of settable bits differ"));
+        }
+
+        for (my_bit, other_bit) in self.bits.iter_mut().zip(other.bits.iter()) {
+            *my_bit |= other_bit;
+        }
+
+        Ok(())
+    }
+
     pub fn from_slice(bits: &[u8]) -> Self {
         Self {
             bits: bits.to_vec(),
-            settable: 0,
+            settable: bits.len() as u64 * 8,
         }
     }
 
-    pub fn with_settable(settable: usize) -> Self {
+    pub fn with_settable(settable: u64) -> Self {
         Self {
             settable,
-            bits: vec![0u8; settable.div_ceil(8)], /* computes the number of bytes necessary for the required number of bits */
+            bits: vec![0u8; settable.div_ceil(8) as usize], /* computes the number of bytes necessary for the required number of bits */
         }
     }
 
     pub fn is_set(&self, index: usize) -> Result<bool, &'static str> {
-        if index > self.settable {
+        if index > self.settable as usize {
             return Err("Index out of bounds");
         }
         let byte_index = index / 8;
@@ -70,7 +82,7 @@ impl BitField {
     }
 
     pub fn set(&mut self, index: usize, value: bool) -> Result<bool, &'static str> {
-        if index > self.settable {
+        if index > self.settable as usize {
             return Err("Index out of bounds");
         }
         let byte_index = index / 8;
@@ -106,7 +118,7 @@ impl BitField {
     pub fn set_bits(&self) -> Vec<usize> {
         let mut indices = vec![];
         for (i, &byte) in self.bits.iter().enumerate() {
-            for bit in 0..8 {
+            for bit in (0..8).rev() {
                 if (1 << bit) & byte != 0 {
                     indices.push((8 * i) + (7 - bit));
                 }

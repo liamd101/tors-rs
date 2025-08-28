@@ -37,7 +37,7 @@ pub struct TorrInfo {
     /// Number of bytes in each piece the file is split into. Usually a power of two, most commonly
     /// 2^18 = 256K
     #[serde(rename = "piece length")]
-    pub piece_length: usize,
+    pub piece_length: u64,
 
     /// string whose length is a multiple of 20. Subdivided into strings of length 20,
     /// each of which is the SHA1 hash of the piece at the corresponding index.
