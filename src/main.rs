@@ -160,7 +160,6 @@ async fn main() {
                 Err(e) => error!("{e}"),
             }
         });
-        break;
     }
 
     while set.join_next().await.is_some() {}

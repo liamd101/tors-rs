@@ -10,6 +10,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::broadcast::{Receiver, Sender};
 use tokio::task::JoinSet;
+use tokio::time::Instant;
 use tokio_util::bytes::BytesMut;
 use tokio_util::codec::{Decoder, Encoder};
 
@@ -191,19 +192,9 @@ impl Pieces {
         }
     }
 
-    pub fn new(num_pieces: usize, num_blocks: usize) -> Self {
-        Self {
-            num_requested: 0,
-            num_downloaded: 0,
-            request_limit: 3,
-            num_total_blocks: num_pieces * num_blocks,
-            blocks: vec![vec![BlockState::UnRequested; num_blocks]; num_pieces],
-        }
-    }
-
     pub fn request(&mut self, piece: usize, block: usize) -> Option<bool> {
         let piece = self.blocks.get_mut(piece)?;
-        if piece.len() >= block {
+        if block >= piece.len() {
             None
         } else {
             piece[block] = BlockState::Requested;
@@ -214,7 +205,7 @@ impl Pieces {
 
     pub fn finish_request(&mut self, piece: usize, block: usize) -> Option<bool> {
         let piece = self.blocks.get_mut(piece)?;
-        if piece.len() >= block {
+        if block >= piece.len() {
             None
         } else {
             if piece[block] == BlockState::Requested {
@@ -399,21 +390,24 @@ async fn read_peer(
 
     loop {
         let mut read_buf = BytesMut::zeroed(5);
-        stream
+        let bytes_read = stream
             .read_exact(&mut read_buf)
             .await
             .context("reading message header")?;
+        if bytes_read != 5 {
+            warn!("read {bytes_read} of message header");
+            continue;
+        }
         let Some(message) = message_codec.decode(&mut read_buf).expect("invalid read") else {
             continue;
         };
-        debug!("message received: {message:?}");
+        info!("message received: {message:?}");
         let Some(message_id) = message.message_id else {
             continue;
         };
 
         match message_id {
             MessageId::Piece => {
-                info!("peer is sending us piece data");
                 let piece_index: u32 = stream.read_u32().await.context("reading piece index")?;
                 let begin: u32 = stream.read_u32().await.context("reading block offset")?;
                 info!("receiving piece={piece_index} offset={begin}");
@@ -423,7 +417,7 @@ async fn read_peer(
                     .truncate(false)
                     .open(&metadata.info.name)
                     .await
-                    .context("opening output file")?;
+                    .with_context(|| "opening output file")?;
 
                 let current_len = file.metadata().await?.len();
                 if current_len != 0 {
@@ -432,7 +426,8 @@ async fn read_peer(
 
                 let piece_start = piece_index as u64 * metadata.info.piece_length;
                 file.seek(SeekFrom::Start(piece_start + begin as u64))
-                    .await?;
+                    .await
+                    .with_context(|| "seeking to {piece_start}")?;
 
                 let mut piece_data = vec![0u8; message.length as usize - 9];
                 let bytes_read = stream
@@ -443,7 +438,7 @@ async fn read_peer(
                     .await
                     .context("writing piece data to file")?;
 
-                debug!("wrote {bytes_read} bytes to {}", piece_start + begin as u64);
+                info!("wrote {bytes_read} bytes to {}", piece_start + begin as u64);
 
                 tx.send(ThreadUpdate::Downloaded(piece_index, begin / BLOCK_SIZE))?;
             }
@@ -500,13 +495,14 @@ async fn write_peer(
     let mut am_interested = false;
 
     let mut message_codec = MessageCodec {};
-    let mut write_buf = BytesMut::new();
 
     // TODO: support `update(&BitField)`
     let mut requested: Pieces =
         Pieces::from_file_info(metadata.info.torr_type.len(), metadata.info.piece_length);
 
     loop {
+        let mut write_buf = BytesMut::new();
+
         match rx.try_recv() {
             Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {}
             Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
@@ -525,7 +521,7 @@ async fn write_peer(
                     length: 1,
                     message_id: Some(MessageId::Have),
                 };
-                debug!("sending message: {message:?}");
+                info!("sending message: {message:?}");
 
                 message_codec.encode(message, &mut write_buf)?;
                 stream
@@ -608,7 +604,7 @@ async fn write_peer(
             );
 
             let block_begin = block_num * BLOCK_SIZE;
-            info!("requesting piece={piece} block={block_num} length={block_size}");
+            info!("requesting piece={piece} block_begin={block_begin} length={block_size}");
             stream
                 .write_u32(piece)
                 .await
