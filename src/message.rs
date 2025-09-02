@@ -188,6 +188,17 @@ pub struct Message {
     pub message_id: Option<MessageId>,
 }
 
+impl Message {
+    pub fn as_bytes(&self) -> Vec<u8> {
+        let mut out = u32::to_be_bytes(self.length).to_vec();
+        match self.message_id {
+            Some(message_id) => out.push(message_id as u8),
+            None => {}
+        }
+        out
+    }
+}
+
 /// Enum representing the type of messages supported by the BitTorrent protocol
 #[repr(u8)]
 #[derive(Debug, Copy, Clone)]
@@ -316,27 +327,5 @@ impl Decoder for MessageCodec {
             length,
             message_id: Some(message_id),
         }))
-    }
-}
-
-impl Encoder<Message> for MessageCodec {
-    type Error = std::io::Error;
-
-    fn encode(&mut self, item: Message, dst: &mut BytesMut) -> Result<(), Self::Error> {
-        if item.length as usize > MAX_MESSAGE_LEN {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("Frame of length {} is too large", item.length),
-            ));
-        }
-        let len_slice = u32::to_be_bytes(item.length);
-        dst.reserve(4);
-        dst.extend_from_slice(&len_slice);
-        if item.message_id.is_none() {
-            return Ok(());
-        }
-        dst.reserve(1);
-        dst.put_u8(item.message_id.unwrap() as u8);
-        Ok(())
     }
 }

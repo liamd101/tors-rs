@@ -491,16 +491,12 @@ async fn write_peer(
 ) -> Result<SplitStream, Error> {
     let mut am_interested = false;
 
-    let mut message_codec = MessageCodec {};
-
     // TODO: support `update(&BitField)`
     let mut requested: Pieces =
         Pieces::from_file_info(metadata.info.torr_type.len(), metadata.info.piece_length);
     requested.update(&my_bitfield.read().unwrap());
 
     loop {
-        let mut write_buf = BytesMut::new();
-
         match rx.try_recv() {
             Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {}
             Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
@@ -521,9 +517,8 @@ async fn write_peer(
                 };
                 info!("sending message: {message:?}");
 
-                message_codec.encode(message, &mut write_buf)?;
                 stream
-                    .write_all(&write_buf)
+                    .write_all(&message.as_bytes())
                     .await
                     .context("writing Interested message")?;
                 stream
@@ -536,7 +531,6 @@ async fn write_peer(
                     length: 13,
                     message_id: Some(MessageId::Cancel),
                 };
-                message_codec.encode(message_header, &mut write_buf)?;
                 for (piece, block) in requested.pending_requests() {
                     let block_size = calculate_block_size(
                         piece,
@@ -545,7 +539,7 @@ async fn write_peer(
                         metadata.info.torr_type.len(),
                     );
                     stream
-                        .write_all(&write_buf)
+                        .write_all(&message_header.as_bytes())
                         .await
                         .context("writing Cancel header")?;
                     stream
@@ -581,9 +575,8 @@ async fn write_peer(
             };
             debug!("sending message: {message:?}");
 
-            message_codec.encode(message, &mut write_buf)?;
             stream
-                .write_all(&write_buf)
+                .write_all(&message.as_bytes())
                 .await
                 .context("writing Interested message")?;
 
@@ -603,9 +596,8 @@ async fn write_peer(
             };
             debug!("sending message: {message:?}");
 
-            message_codec.encode(message, &mut write_buf)?;
             stream
-                .write_all(&write_buf)
+                .write_all(&message.as_bytes())
                 .await
                 .context("writing NotInterested message")?;
 
@@ -620,9 +612,8 @@ async fn write_peer(
                 message_id: Some(MessageId::Request),
             };
             debug!("sending message: {message:?}");
-            message_codec.encode(message, &mut write_buf)?;
             stream
-                .write_all(&write_buf)
+                .write_all(&message.as_bytes())
                 .await
                 .context("writing Request header")?;
             // now want to select random piece / block that we do not currently have
