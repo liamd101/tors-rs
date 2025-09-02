@@ -11,7 +11,7 @@ use tokio::net::TcpStream;
 use tokio::sync::broadcast::{Receiver, Sender};
 use tokio::task::JoinSet;
 use tokio_util::bytes::BytesMut;
-use tokio_util::codec::{Decoder, Encoder};
+use tokio_util::codec::Decoder;
 
 use tracing::{Instrument, debug, error, info, warn};
 

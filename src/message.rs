@@ -1,5 +1,5 @@
-use tokio_util::bytes::{Buf, BufMut, BytesMut};
-use tokio_util::codec::{Decoder, Encoder};
+use tokio_util::bytes::{Buf, BytesMut};
+use tokio_util::codec::Decoder;
 
 use tracing::error;
 
@@ -191,10 +191,9 @@ pub struct Message {
 impl Message {
     pub fn as_bytes(&self) -> Vec<u8> {
         let mut out = u32::to_be_bytes(self.length).to_vec();
-        match self.message_id {
-            Some(message_id) => out.push(message_id as u8),
-            None => {}
-        }
+        if let Some(message_id) = self.message_id {
+            out.push(message_id as u8)
+        };
         out
     }
 }
