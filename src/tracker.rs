@@ -13,6 +13,7 @@ use tracing::error;
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 pub enum Response {
+    /// Successful response from the tracker. Contains necessary info for communicating with peers
     Success {
         /// Similar to failure reason, but response still gets processed normally. Message is shown
         /// just like an error.
@@ -40,8 +41,9 @@ pub enum Response {
         /// The number of non-seeder peers, aka "leechers"
         incomplete: usize,
     },
+    /// Unsuccessful response from the tracker. Contains an error message
     Error {
-        /// The value is a human-readable error message as to why the request failed (string).
+        /// The value is a human-readable error message as to why the request failed.
         #[serde(rename = "failure reason")]
         failure_reason: String,
     },
@@ -105,6 +107,7 @@ impl std::fmt::Display for TrackerEvent {
     }
 }
 
+/// Creates a populated Tracker URL for sending an initial request
 pub fn create_tracker_url(metadata: &Metadata, listener: &TcpListener) -> Result<String> {
     let announce: reqwest::Url = metadata.announce.parse()?;
     match announce.scheme() {

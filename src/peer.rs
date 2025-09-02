@@ -191,6 +191,17 @@ impl Pieces {
         }
     }
 
+    /// Updates `self` so that all blocks and pieces that are set true in the bitfield are set to `Completed`
+    /// in `self.blocks`
+    pub fn update(&mut self, bitfield: &BitField) {
+        for piece in bitfield.set_bits() {
+            let piece = self.blocks.get_mut(piece).unwrap();
+            piece.iter_mut().map(|b| *b = BlockState::Completed).count();
+        }
+    }
+
+    /// Returns a Vec of `(piece_idx, block_idx)` pairs for every requested (but not downloaded)
+    /// block
     pub fn pending_requests(&self) -> Vec<(u32, u32)> {
         let mut out = Vec::with_capacity(self.num_requested);
         for (piece_idx, piece) in self.blocks.iter().enumerate() {
@@ -203,6 +214,7 @@ impl Pieces {
         out
     }
 
+    /// Marks a block as Completed and decrements the number of requested blocks
     pub fn finish_request(&mut self, piece: usize, block: usize) -> Option<bool> {
         let piece = self.blocks.get_mut(piece)?;
         let state = piece.get_mut(block)?;
@@ -484,6 +496,7 @@ async fn write_peer(
     // TODO: support `update(&BitField)`
     let mut requested: Pieces =
         Pieces::from_file_info(metadata.info.torr_type.len(), metadata.info.piece_length);
+    requested.update(&my_bitfield.read().unwrap());
 
     loop {
         let mut write_buf = BytesMut::new();
@@ -503,7 +516,7 @@ async fn write_peer(
             Ok(ThreadUpdate::Completed(piece)) => {
                 requested.complete_piece(piece);
                 let message = Message {
-                    length: 1,
+                    length: 5,
                     message_id: Some(MessageId::Have),
                 };
                 info!("sending message: {message:?}");

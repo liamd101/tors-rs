@@ -87,7 +87,6 @@ pub struct TorrInfo {
     /// `MultiFile` .torrent file and a `SingleFile` .torrent file.
     #[serde(flatten)]
     pub torr_type: FileTypes,
-
 }
 
 #[derive(Debug, Clone)]
