@@ -196,6 +196,41 @@ impl Message {
         };
         out
     }
+
+    pub fn cancel() -> Self {
+        Self {
+            length: 13,
+            message_id: Some(MessageId::Cancel),
+        }
+    }
+
+    pub fn have() -> Self {
+        Self {
+            length: 5,
+            message_id: Some(MessageId::Have),
+        }
+    }
+
+    pub fn not_interested() -> Self {
+        Self {
+            length: 1,
+            message_id: Some(MessageId::NotInterested),
+        }
+    }
+
+    pub fn interested() -> Self {
+        Self {
+            length: 1,
+            message_id: Some(MessageId::Interested),
+        }
+    }
+
+    pub fn request() -> Self {
+        Self {
+            length: 13,
+            message_id: Some(MessageId::Request),
+        }
+    }
 }
 
 /// Enum representing the type of messages supported by the BitTorrent protocol

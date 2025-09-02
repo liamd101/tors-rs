@@ -511,10 +511,7 @@ async fn write_peer(
             }
             Ok(ThreadUpdate::Completed(piece)) => {
                 requested.complete_piece(piece);
-                let message = Message {
-                    length: 5,
-                    message_id: Some(MessageId::Have),
-                };
+                let message = Message::have();
                 info!("sending message: {message:?}");
 
                 stream
@@ -527,10 +524,7 @@ async fn write_peer(
                     .context("writing Have payload")?;
             }
             Ok(ThreadUpdate::FileComplete) => {
-                let message_header = Message {
-                    length: 13,
-                    message_id: Some(MessageId::Cancel),
-                };
+                let message_header = Message::cancel();
                 for (piece, block) in requested.pending_requests() {
                     let block_size = calculate_block_size(
                         piece,
@@ -569,10 +563,7 @@ async fn write_peer(
             .expect("one of us has incorrect bitfield")
             && !am_interested
         {
-            let message = Message {
-                length: 1,
-                message_id: Some(MessageId::Interested),
-            };
+            let message = Message::interested();
             debug!("sending message: {message:?}");
 
             stream
@@ -590,10 +581,7 @@ async fn write_peer(
             .expect("one of us has incorrect bitfield")
             && am_interested
         {
-            let message = Message {
-                length: 1,
-                message_id: Some(MessageId::NotInterested),
-            };
+            let message = Message::not_interested();
             debug!("sending message: {message:?}");
 
             stream
@@ -607,10 +595,7 @@ async fn write_peer(
         let peer_has = peer_bitfield.read().unwrap().set_bits();
         if !choked && let Some((piece, block_num)) = requested.request_new(peer_has) {
             // want to send a single request message
-            let message = Message {
-                length: 13,
-                message_id: Some(MessageId::Request),
-            };
+            let message = Message::request();
             debug!("sending message: {message:?}");
             stream
                 .write_all(&message.as_bytes())
