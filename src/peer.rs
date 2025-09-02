@@ -10,7 +10,6 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::broadcast::{Receiver, Sender};
 use tokio::task::JoinSet;
-use tokio::time::Instant;
 use tokio_util::bytes::BytesMut;
 use tokio_util::codec::{Decoder, Encoder};
 
@@ -68,7 +67,7 @@ impl Peer {
 /// The handshake is a required message and must be the first message transmitted by the client
 /// It is (49+len(pstr)) bytes long
 #[derive(Debug, Clone)]
-pub struct PeerHandshake {
+pub struct Handshake {
     /// String length of pstr as a single raw byte
     pub pstrlen: u8,
     /// String identifier of the protocol
@@ -84,7 +83,7 @@ pub struct PeerHandshake {
     pub peer_id: [u8; 20],
 }
 
-impl PeerHandshake {
+impl Handshake {
     pub fn to_bytes(&self) -> Vec<u8> {
         let total_len = 1 + self.pstr.len() + 8 + 20 + 20;
         let mut bytes: Vec<u8> = Vec::with_capacity(total_len);
@@ -114,7 +113,7 @@ impl PeerHandshake {
         let peer_id: [u8; 20] = value[(pstrlen as usize + 29)..(pstrlen as usize + 49)]
             .try_into()
             .map_err(|_| "Invalid peer_id field length")?;
-        Ok(PeerHandshake {
+        Ok(Handshake {
             pstrlen,
             pstr,
             reserved,
@@ -136,7 +135,7 @@ impl PeerHandshake {
 
 pub async fn try_handshake(
     stream: &mut TcpStream,
-    handshake: &PeerHandshake,
+    handshake: &Handshake,
 ) -> Result<bool, std::io::Error> {
     let handshake_bytes = handshake.to_bytes();
 
@@ -147,7 +146,7 @@ pub async fn try_handshake(
 
     stream.read_exact(&mut parts).await?;
 
-    let peer_response = PeerHandshake::from_bytes(&parts).expect("invalid peer response");
+    let peer_response = Handshake::from_bytes(&parts).expect("invalid peer response");
     Ok(peer_response.info_hash == handshake.info_hash)
 }
 
@@ -164,7 +163,7 @@ struct Pieces {
     num_total_blocks: usize,
     num_requested: usize,
     num_downloaded: usize,
-    request_limit: usize,
+    pipeline_len: usize,
     blocks: Vec<Vec<BlockState>>,
 }
 impl Pieces {
@@ -185,39 +184,35 @@ impl Pieces {
         Self {
             num_requested: 0,
             num_downloaded: 0,
-            request_limit: 3,
+            pipeline_len: 5,
             num_total_blocks: ((num_pieces - 1) * standard_num_blocks + last_piece_num_blocks)
                 as usize,
             blocks,
         }
     }
 
-    pub fn request(&mut self, piece: usize, block: usize) -> Option<bool> {
-        let piece = self.blocks.get_mut(piece)?;
-        if block >= piece.len() {
-            None
-        } else {
-            piece[block] = BlockState::Requested;
-            self.num_requested += 1;
-            Some(true)
+    pub fn pending_requests(&self) -> Vec<(u32, u32)> {
+        let mut out = Vec::with_capacity(self.num_requested);
+        for (piece_idx, piece) in self.blocks.iter().enumerate() {
+            for (block_idx, &block) in piece.iter().enumerate() {
+                if block == BlockState::Requested {
+                    out.push((piece_idx as u32, block_idx as u32))
+                }
+            }
         }
+        out
     }
 
     pub fn finish_request(&mut self, piece: usize, block: usize) -> Option<bool> {
         let piece = self.blocks.get_mut(piece)?;
-        if block >= piece.len() {
-            None
-        } else {
-            if piece[block] == BlockState::Requested {
-                self.num_requested -= 1;
-            }
-            piece[block] = BlockState::Completed;
-            Some(true)
-        }
+        let state = piece.get_mut(block)?;
+        *state = BlockState::Completed;
+        self.num_requested -= 1;
+        Some(true)
     }
 
     pub fn request_new(&mut self, pieces: Vec<usize>) -> Option<(u32, u32)> {
-        if self.num_requested >= self.request_limit {
+        if self.num_requested >= self.pipeline_len {
             return None;
         }
         // want to create a Vec<(usize, usize)> where first index is in pieces and select randomly from there
@@ -275,11 +270,7 @@ pub async fn handle_peer(
 ) -> Result<(), std::io::Error> {
     debug!("handling peer connection");
 
-    let num_pieces: u64 = metadata
-        .info
-        .torr_type
-        .len()
-        .div_ceil(metadata.info.piece_length);
+    let num_pieces: u64 = metadata.num_pieces() as u64;
 
     // TODO: this will definitely need to be redone with mrsw design
     let peer_bitfield = Arc::new(RwLock::new(BitField::with_settable(num_pieces)));
@@ -378,15 +369,9 @@ async fn read_peer(
     peer_bitfield: Arc<RwLock<BitField>>,
     choked: Arc<RwLock<bool>>,
 ) -> Result<SplitStream, Error> {
-    let num_pieces = metadata
-        .info
-        .torr_type
-        .len()
-        .div_ceil(metadata.info.piece_length);
+    let num_pieces = metadata.num_pieces() as u64;
 
     let mut message_codec = MessageCodec {};
-    // this should be a Vec<(u32, u32)>
-    // that way we can cancel previous requests that are no longer needed
 
     loop {
         let mut read_buf = BytesMut::zeroed(5);
@@ -532,6 +517,38 @@ async fn write_peer(
                     .write_u32(piece)
                     .await
                     .context("writing Have payload")?;
+            }
+            Ok(ThreadUpdate::FileComplete) => {
+                let message_header = Message {
+                    length: 13,
+                    message_id: Some(MessageId::Cancel),
+                };
+                message_codec.encode(message_header, &mut write_buf)?;
+                for (piece, block) in requested.pending_requests() {
+                    let block_size = calculate_block_size(
+                        piece,
+                        block,
+                        metadata.info.piece_length,
+                        metadata.info.torr_type.len(),
+                    );
+                    stream
+                        .write_all(&write_buf)
+                        .await
+                        .context("writing Cancel header")?;
+                    stream
+                        .write_u32(piece)
+                        .await
+                        .context("writing Cancel piece")?;
+                    stream
+                        .write_u32(block * BLOCK_SIZE)
+                        .await
+                        .context("writing Cancel piece")?;
+                    stream
+                        .write_u32(block_size)
+                        .await
+                        .context("writing Cancel piece")?;
+                }
+                // TODO: send cancel messages for all requested files
             }
         }
 

@@ -1,3 +1,4 @@
+pub mod download;
 pub mod message;
 pub mod parsing;
 pub mod peer;
@@ -16,4 +17,7 @@ pub enum ThreadUpdate {
     /// thread computing the downloaded piece hash and comparing against the piece hash that is
     /// present in the `.torrent` file.
     Completed(u32),
+    /// Indicates that the entire file has been completed, and that any requests for the file
+    /// shoudl be cancelled.
+    FileComplete,
 }

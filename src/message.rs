@@ -235,7 +235,13 @@ pub enum MessageId {
     Piece = 7,
     /// Indicates a fixed-length message to cancel block requests
     ///
-    /// The payload is identical to that of the "Request" message
+    /// The payload contains the following information in order:
+    ///   index  : u32 integer specifying the zero-based piece index
+    ///   begin  : u32 integer specifying the zero-based byte offset within the piece
+    ///   length : u32 integer specifying the requested length
+    ///
+    /// For more information about Request messages, see here:
+    /// https://wiki.theory.org/BitTorrentSpecification#request:_.3Clen.3D0013.3E.3Cid.3D6.3E.3Cindex.3E.3Cbegin.3E.3Clength.3E
     ///
     /// It is typically used during "End Game". TODO
     Cancel = 8,

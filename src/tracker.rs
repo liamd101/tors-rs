@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::peer::Peer;
+use crate::{parsing::Metadata, peer::Peer};
 
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer};
@@ -12,7 +12,7 @@ use tracing::error;
 #[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
-pub enum TrackerResponse {
+pub enum Response {
     Success {
         /// Similar to failure reason, but response still gets processed normally. Message is shown
         /// just like an error.
@@ -30,7 +30,10 @@ pub enum TrackerResponse {
         /// previous announce sent a tracker id, do not discard the old value; keep using it.
         tracker_id: Option<String>,
 
+        /// A list of Peers that the Tracker is aware of. This is the list that the client will
+        /// communicate with at all times.
         peers: Peers,
+
         /// The number of peers with the entire file, i.e. seeders
         complete: usize,
 
@@ -102,10 +105,7 @@ impl std::fmt::Display for TrackerEvent {
     }
 }
 
-pub fn create_tracker_url(
-    metadata: &crate::parsing::Metadata,
-    listener: TcpListener,
-) -> Result<String, anyhow::Error> {
+pub fn create_tracker_url(metadata: &Metadata, listener: &TcpListener) -> Result<String> {
     let announce: reqwest::Url = metadata.announce.parse()?;
     match announce.scheme() {
         "http" | "https" => {}
@@ -114,9 +114,13 @@ pub fn create_tracker_url(
             return Err(anyhow::Error::msg("Invalid Scheme".to_string()));
         }
     }
-
+    let peer_id: [u8; 20] = std::env::var("USER_PEER_ID")
+        .expect("USER_PEER_ID must be set.")
+        .as_bytes()
+        .try_into()
+        .expect("invalid USER_PEER_ID.");
     let port = listener.local_addr().expect("getting addr").port();
-    let peer_id = crate::parsing::hash_string("liamdodds11223344556".to_string());
+
     let mut params: HashMap<String, String> = HashMap::new();
     params.insert("port".into(), format!("{port}"));
     params.insert("event".into(), TrackerEvent::Started.to_string());
@@ -128,13 +132,13 @@ pub fn create_tracker_url(
         urlencoding::encode_binary(&peer_id).to_string(),
     );
     match metadata.info.torr_type {
-        crate::parsing::FileTypes::SingleFile { length } => {
+        crate::parsing::FileTypes::SingleFile { length, .. } => {
             params.insert("left".into(), format!("{length}"));
         }
         _ => unimplemented!("don't have support for multiple files yet"),
     }
 
-    let info_hash = crate::parsing::get_info_hash(&metadata.info);
+    let info_hash = metadata.info_hash();
     params.insert(
         "info_hash".into(),
         urlencoding::encode_binary(&info_hash).to_string(),
@@ -148,4 +152,14 @@ pub fn create_tracker_url(
         .join("&");
 
     Ok(format!("{}?{params}", metadata.announce))
+}
+
+pub async fn make_request(metadata: &Metadata, listener: &TcpListener) -> anyhow::Result<Response> {
+    let announce = create_tracker_url(metadata, listener).expect("valid tracker URL");
+
+    // let announce = reqwest::Url::parse_with_params(announce.as_str(), params).expect("unable to create tracker URL");
+    let res = reqwest::get(announce).await.expect("invalid tracker URL");
+    let body = res.bytes().await.expect("error reading body");
+
+    Ok(serde_bencode::from_bytes(&body)?)
 }
