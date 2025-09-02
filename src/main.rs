@@ -5,12 +5,11 @@ use tors_rs::{
     tracker,
 };
 
-use anyhow::Result;
 use clap::Parser;
 use dotenv::dotenv;
 use tokio::{net::TcpListener, sync::broadcast, task::JoinSet};
 use tracing::{Instrument, debug, error, info, warn};
-use tracing_subscriber::{self, EnvFilter};
+use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -19,16 +18,6 @@ struct Args {
 
     #[arg(short, long, required = true)]
     file: String,
-}
-
-async fn find_open_port() -> Result<TcpListener, std::io::Error> {
-    for port_num in 6881..=6889 {
-        match TcpListener::bind(format!("127.0.0.1:{port_num}")).await {
-            Ok(out) => return Ok(out),
-            Err(_) => continue,
-        }
-    }
-    Err(std::io::Error::other("unable to find open port"))
 }
 
 #[tokio::main]
@@ -49,7 +38,9 @@ async fn main() {
         .try_into()
         .expect("invalid peer ID.");
 
-    let listener: TcpListener = find_open_port().await.expect("unable to find open port.");
+    let listener: TcpListener = tors_rs::bind_port()
+        .await
+        .expect("unable to find open port.");
 
     let res = tracker::make_request(&metadata, &listener)
         .await

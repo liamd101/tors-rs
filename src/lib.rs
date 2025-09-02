@@ -18,6 +18,18 @@ pub enum ThreadUpdate {
     /// present in the `.torrent` file.
     Completed(u32),
     /// Indicates that the entire file has been completed, and that any requests for the file
-    /// shoudl be cancelled.
+    /// should be cancelled.
     FileComplete,
+}
+
+/// Looks for and binds a TcpListener to an open port between 6881 and 6889 inclusive.
+/// This is per the BitTorrent spec, where these are the list of recommended ports.
+pub async fn bind_port() -> anyhow::Result<tokio::net::TcpListener> {
+    for port_num in 6881..=6889 {
+        match tokio::net::TcpListener::bind(format!("127.0.0.1:{port_num}")).await {
+            Ok(out) => return Ok(out),
+            Err(_) => continue,
+        }
+    }
+    Err(anyhow::anyhow!("Unable to find an open port"))
 }
