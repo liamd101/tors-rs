@@ -8,16 +8,15 @@ use anyhow::{Context, Error};
 
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::broadcast::{Receiver, Sender};
+use tokio::select;
+use tokio::sync::broadcast;
 use tokio::task::JoinSet;
-use tokio_util::bytes::BytesMut;
-use tokio_util::codec::Decoder;
 
 use tracing::{Instrument, debug, error, info, warn};
 
 use crate::{
     ThreadUpdate,
-    message::{BitField, Message, MessageCodec, MessageId},
+    message::{BitField, Message, MessageId},
     parsing::Metadata,
 };
 
@@ -216,11 +215,19 @@ impl Pieces {
 
     /// Marks a block as Completed and decrements the number of requested blocks
     pub fn finish_request(&mut self, piece: usize, block: usize) -> Option<bool> {
+        if self.num_requested == 0 {
+            return None;
+        }
         let piece = self.blocks.get_mut(piece)?;
         let state = piece.get_mut(block)?;
-        *state = BlockState::Completed;
-        self.num_requested -= 1;
-        Some(true)
+        match state {
+            BlockState::Completed => None,
+            _ => {
+                *state = BlockState::Completed;
+                self.num_requested -= 1;
+                Some(true)
+            }
+        }
     }
 
     pub fn request_new(&mut self, pieces: Vec<usize>) -> Option<(u32, u32)> {
@@ -260,6 +267,14 @@ impl Pieces {
         Some(out)
     }
 
+    pub fn set(&mut self, piece: usize, block: usize, state: BlockState) -> Option<BlockState> {
+        let piece = self.blocks.get_mut(piece)?;
+        let old_state = piece.get_mut(block)?;
+        let out = *old_state;
+        *old_state = state;
+        Some(out)
+    }
+
     pub fn complete_piece(&mut self, piece: u32) -> Option<bool> {
         let piece = self.blocks.get_mut(piece as usize)?;
         for block in piece.iter_mut() {
@@ -274,8 +289,8 @@ impl Pieces {
 
 #[allow(unreachable_code)]
 pub async fn handle_peer(
-    tx: Sender<ThreadUpdate>,
-    mut _rx: Receiver<ThreadUpdate>,
+    parent_tx: broadcast::Sender<ThreadUpdate>,
+    mut parent_rx: broadcast::Receiver<ThreadUpdate>,
     stream: TcpStream,
     metadata: Metadata,
     my_bitfield: Arc<RwLock<BitField>>,
@@ -291,11 +306,12 @@ pub async fn handle_peer(
     let (read_stream, write_stream) = tokio::io::split(stream);
 
     let mut set = JoinSet::new();
+    let (child_tx, mut child_rx) = broadcast::channel::<ThreadUpdate>(32);
 
     let current_span = tracing::Span::current();
 
-    let read_tx = tx.clone();
-    let read_rx = tx.subscribe();
+    let read_tx = child_tx.clone();
+    let read_rx = child_tx.subscribe();
     let read_metadata = metadata.clone();
     let read_choked = choked.clone();
     let read_peer_bitfield = peer_bitfield.clone();
@@ -320,8 +336,8 @@ pub async fn handle_peer(
     });
 
     let current_span = tracing::Span::current();
-    let write_tx = tx.clone();
-    let write_rx = tx.subscribe();
+    let write_tx = child_tx.clone();
+    let write_rx = child_tx.subscribe();
     let write_metadata = metadata.clone();
     let write_bitfield = my_bitfield.clone();
     let write_choked = choked.clone();
@@ -347,14 +363,61 @@ pub async fn handle_peer(
         }
     });
 
+    set.spawn(
+        async move {
+            let mut requested: Pieces =
+                Pieces::from_file_info(metadata.info.torr_type.len(), metadata.info.piece_length);
+
+            loop {
+                select! {
+                result = child_rx.recv() => {
+                    match result {
+                        Ok(ThreadUpdate::Downloaded(piece, block)) => {
+                            match requested.set(piece as usize, block as usize, BlockState::Completed) {
+                                None | Some(BlockState::Completed) => {},
+                                _ => {
+                                    parent_tx.send(ThreadUpdate::Downloaded(piece, block))?;
+                                },
+                            }
+                        }
+                        Ok(ThreadUpdate::FileComplete) => break,
+                        Ok(_) => {},
+                        Err(broadcast::error::RecvError::Closed) => break,
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            warn!("child_rx Lagged by {n}. ignoring for now.");
+                        },
+                    }
+                }
+
+                result = parent_rx.recv() => {
+                    match result {
+                        Ok(ThreadUpdate::Downloaded(_, _)) => {}
+                        Ok(update) => {
+                            child_tx.send(update)?;
+                        },
+                        Err(broadcast::error::RecvError::Closed) => break,
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            warn!("parent_rx: Lagged by {n}. ignoring for now.");
+                        },
+                    }
+                }
+                };
+            }
+
+            Ok(ChildUpdates::ParentClosed)
+        }
+        .instrument(tracing::Span::current()),
+    );
+
     let mut read_stream: Option<tokio::io::ReadHalf<TcpStream>> = None;
     let mut write_stream: Option<tokio::io::WriteHalf<TcpStream>> = None;
 
     while let Some(result) = set.join_next().await {
         if let Ok(Ok(stream)) = result {
             match stream {
-                SplitStream::Write(stream) => write_stream = Some(stream),
-                SplitStream::Read(stream) => read_stream = Some(stream),
+                ChildUpdates::Write(stream) => write_stream = Some(stream),
+                ChildUpdates::Read(stream) => read_stream = Some(stream),
+                ChildUpdates::ParentClosed => {}
             }
         }
     }
@@ -367,142 +430,204 @@ pub async fn handle_peer(
     }
 }
 
-enum SplitStream {
+enum ChildUpdates {
     Read(tokio::io::ReadHalf<TcpStream>),
     Write(tokio::io::WriteHalf<TcpStream>),
+    ParentClosed,
 }
 
-#[allow(unreachable_code)]
+fn handle_channel_message(
+    message: Result<ThreadUpdate, broadcast::error::RecvError>,
+) -> anyhow::Result<bool> {
+    match message {
+        Err(broadcast::error::RecvError::Lagged(_)) => {
+            error!("we are lagged somehow");
+            Err(anyhow::anyhow!("Stream lagged"))
+        }
+        Err(broadcast::error::RecvError::Closed) => {
+            warn!("Write half exited. Read half exiting.");
+            Ok(true)
+        }
+        Ok(ThreadUpdate::FileComplete) => Ok(true),
+        _ => Ok(false),
+    }
+}
+
 async fn read_peer(
-    tx: Sender<ThreadUpdate>,
-    mut _rx: Receiver<ThreadUpdate>,
+    tx: broadcast::Sender<ThreadUpdate>,
+    mut rx: broadcast::Receiver<ThreadUpdate>,
     mut stream: tokio::io::ReadHalf<TcpStream>,
     metadata: Metadata,
     peer_bitfield: Arc<RwLock<BitField>>,
     choked: Arc<RwLock<bool>>,
-) -> Result<SplitStream, Error> {
-    let num_pieces = metadata.num_pieces() as u64;
-
-    let mut message_codec = MessageCodec {};
-
+) -> anyhow::Result<ChildUpdates, anyhow::Error> {
     loop {
-        let mut read_buf = BytesMut::zeroed(5);
-        let bytes_read = stream
-            .read_exact(&mut read_buf)
-            .await
-            .context("reading message header")?;
-        if bytes_read != 5 {
-            warn!("read {bytes_read} of message header");
-            continue;
-        }
-        let Some(message) = message_codec.decode(&mut read_buf).expect("invalid read") else {
-            continue;
-        };
-        info!("message received: {message:?}");
-        let Some(message_id) = message.message_id else {
-            continue;
-        };
-
-        match message_id {
-            MessageId::Piece => {
-                let piece_index: u32 = stream.read_u32().await.context("reading piece index")?;
-                let begin: u32 = stream.read_u32().await.context("reading block offset")?;
-                info!("receiving piece={piece_index} offset={begin}");
-                let mut file = tokio::fs::File::options()
-                    .create(true)
-                    .write(true)
-                    .truncate(false)
-                    .open(&metadata.info.name)
-                    .await
-                    .with_context(|| "opening output file")?;
-
-                let current_len = file.metadata().await?.len();
-                if current_len != 0 {
-                    file.set_len(metadata.info.torr_type.len()).await?;
+        select! {
+            channel_result = rx.recv() => {
+                if handle_channel_message(channel_result)? {
+                    break
                 }
-
-                let piece_start = piece_index as u64 * metadata.info.piece_length;
-                file.seek(SeekFrom::Start(piece_start + begin as u64))
-                    .await
-                    .with_context(|| "seeking to {piece_start}")?;
-
-                let mut piece_data = vec![0u8; message.length as usize - 9];
-                let bytes_read = stream
-                    .read_exact(&mut piece_data)
-                    .await
-                    .context("reading piece data")?;
-                file.write_all(&piece_data)
-                    .await
-                    .context("writing piece data to file")?;
-
-                info!("wrote {bytes_read} bytes to {}", piece_start + begin as u64);
-
-                tx.send(ThreadUpdate::Downloaded(piece_index, begin / BLOCK_SIZE))?;
             }
 
-            MessageId::BitField => {
-                let mut payload = vec![0u8; message.length as usize - 1];
-                stream.read_exact(&mut payload).await?;
-                let sent_bitfield =
-                    BitField::new(payload, num_pieces).expect("peer has an impossible bitfield");
-                peer_bitfield
-                    .write()
-                    .unwrap()
-                    .update(&sent_bitfield)
-                    .context("updating peer bitfield from sent")?;
-                debug!("bitfield={peer_bitfield:?}");
+            peer_result = read_message(&mut stream) => {
+                if let Some(message) = peer_result? {
+                    process_message(
+                        message,
+                        &tx,
+                        &mut stream,
+                        metadata.clone(),
+                        &peer_bitfield,
+                        &choked,
+                    )
+                    .await?;
+                }
             }
-
-            MessageId::Interested => {
-                // TODO: send message to parent receiver that they are interested in a piece
-                // from us
-            }
-
-            MessageId::Have => {
-                let index: u32 = stream.read_u32().await?;
-                peer_bitfield
-                    .write()
-                    .unwrap()
-                    .set(index as usize, true)
-                    .expect("invalid index");
-            }
-
-            MessageId::UnChoke => {
-                *choked.write().unwrap() = false;
-            }
-
-            MessageId::Choke => *choked.write().unwrap() = true,
-
-            _ => todo!(),
         }
     }
-    Ok(SplitStream::Read(stream))
+
+
+    Ok(ChildUpdates::Read(stream))
 }
 
-#[allow(unreachable_code)]
+async fn read_message(
+    stream: &mut tokio::io::ReadHalf<TcpStream>,
+) -> anyhow::Result<Option<Message>> {
+    let mut length_bytes = [0u8; 4];
+
+    let bytes_read = stream.read_exact(&mut length_bytes).await?;
+    if bytes_read != 4 {
+        warn!("read {bytes_read} of message header");
+        return Ok(None);
+    }
+
+    let length = u32::from_be_bytes(length_bytes);
+    if length == 0 {
+        info!("Keep alive reeived. continuing");
+        return Ok(None);
+    }
+
+    let message_id = stream.read_u8().await?;
+    let message_id = MessageId::try_from(message_id)?;
+
+    Ok(Some(Message {
+        length,
+        message_id: Some(message_id),
+    }))
+}
+
+async fn process_message(
+    message: Message,
+    tx: &broadcast::Sender<ThreadUpdate>,
+    stream: &mut tokio::io::ReadHalf<TcpStream>,
+    metadata: Metadata,
+    peer_bitfield: &Arc<RwLock<BitField>>,
+    choked: &Arc<RwLock<bool>>,
+) -> anyhow::Result<()> {
+    let Some(message_id) = message.message_id else {
+        return Ok(());
+    };
+
+    match message_id {
+        MessageId::Piece => {
+            let piece_index: u32 = stream.read_u32().await.context("reading piece index")?;
+            let begin: u32 = stream.read_u32().await.context("reading block offset")?;
+            info!("receiving piece={piece_index} offset={begin}");
+            let mut file = tokio::fs::File::options()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(&metadata.info.name)
+                .await
+                .with_context(|| "opening output file")?;
+
+            let current_len = file.metadata().await?.len();
+            if current_len != 0 {
+                file.set_len(metadata.info.torr_type.len()).await?;
+            }
+
+            let piece_start = piece_index as u64 * metadata.info.piece_length;
+            file.seek(SeekFrom::Start(piece_start + begin as u64))
+                .await
+                .with_context(|| "seeking to {piece_start}")?;
+
+            let mut piece_data = vec![0u8; message.length as usize - 9];
+            let bytes_read = stream
+                .read_exact(&mut piece_data)
+                .await
+                .context("reading piece data")?;
+            file.write_all(&piece_data)
+                .await
+                .context("writing piece data to file")?;
+
+            debug!("wrote {bytes_read} bytes to {}", piece_start + begin as u64);
+
+            tx.send(ThreadUpdate::Downloaded(piece_index, begin / BLOCK_SIZE))?;
+        }
+
+        MessageId::BitField => {
+            let mut payload = vec![0u8; message.length as usize - 1];
+            stream.read_exact(&mut payload).await?;
+            let sent_bitfield = BitField::new(payload, metadata.num_pieces() as u64)
+                .expect("peer has an impossible bitfield");
+            peer_bitfield
+                .write()
+                .unwrap()
+                .update(&sent_bitfield)
+                .context("updating peer bitfield from sent")?;
+            debug!("bitfield={peer_bitfield:?}");
+        }
+
+        MessageId::Interested => {
+            // TODO: send message to parent receiver that they are interested in a piece
+            // from us
+        }
+
+        MessageId::Have => {
+            let index: u32 = stream.read_u32().await?;
+            peer_bitfield
+                .write()
+                .unwrap()
+                .set(index as usize, true)
+                .expect("invalid index");
+        }
+
+        MessageId::UnChoke => {
+            *choked.write().unwrap() = false;
+        }
+
+        MessageId::Choke => *choked.write().unwrap() = true,
+
+        _ => todo!(),
+    }
+
+    Ok(())
+}
+
 async fn write_peer(
-    _tx: Sender<ThreadUpdate>,
-    mut rx: Receiver<ThreadUpdate>,
+    _tx: broadcast::Sender<ThreadUpdate>,
+    mut rx: broadcast::Receiver<ThreadUpdate>,
     mut stream: tokio::io::WriteHalf<TcpStream>,
     metadata: Metadata,
     my_bitfield: Arc<RwLock<BitField>>,
     peer_bitfield: Arc<RwLock<BitField>>,
     choked: Arc<RwLock<bool>>,
-) -> Result<SplitStream, Error> {
+) -> Result<ChildUpdates, Error> {
     let mut am_interested = false;
-
-    // TODO: support `update(&BitField)`
     let mut requested: Pieces =
         Pieces::from_file_info(metadata.info.torr_type.len(), metadata.info.piece_length);
     requested.update(&my_bitfield.read().unwrap());
 
     loop {
         match rx.try_recv() {
-            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {}
-            Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
-            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
-                todo!()
+            Err(broadcast::error::TryRecvError::Lagged(_)) => {
+                error!("we are lagged somehow");
+                todo!();
             }
+            Err(broadcast::error::TryRecvError::Closed) => {
+                info!("Write half exited. Read half exiting.");
+                break;
+            }
+            Err(broadcast::error::TryRecvError::Empty) => {}
             Ok(ThreadUpdate::Downloaded(piece, block)) => {
                 match requested.finish_request(piece as usize, block as usize) {
                     Some(_) => debug!("updated requested pieces"),
@@ -549,7 +674,8 @@ async fn write_peer(
                         .await
                         .context("writing Cancel piece")?;
                 }
-                // TODO: send cancel messages for all requested files
+                // TODO: implement seeding to peers so we don't just disconnect like an ass
+                break;
             }
         }
 
@@ -594,14 +720,13 @@ async fn write_peer(
 
         let peer_has = peer_bitfield.read().unwrap().set_bits();
         if !choked && let Some((piece, block_num)) = requested.request_new(peer_has) {
-            // want to send a single request message
             let message = Message::request();
             debug!("sending message: {message:?}");
             stream
                 .write_all(&message.as_bytes())
                 .await
                 .context("writing Request header")?;
-            // now want to select random piece / block that we do not currently have
+
             let block_size = calculate_block_size(
                 piece,
                 block_num,
@@ -610,7 +735,7 @@ async fn write_peer(
             );
 
             let block_begin = block_num * BLOCK_SIZE;
-            info!("requesting piece={piece} block_begin={block_begin} length={block_size}");
+            info!("requesting piece={piece} block_begin={block_begin}");
             stream
                 .write_u32(piece)
                 .await
@@ -625,7 +750,7 @@ async fn write_peer(
                 .context("writing block_size")?;
         }
     }
-    Ok(SplitStream::Write(stream))
+    Ok(ChildUpdates::Write(stream))
 }
 
 /// Helper function for computing the correct blocksize for a given piece and block pair

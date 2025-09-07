@@ -3,6 +3,8 @@ pub mod message;
 pub mod parsing;
 pub mod peer;
 pub mod tracker;
+pub mod config;
+pub mod torrent;
 
 #[derive(Clone, Debug)]
 /// Enum representing some messages that get sent between peer threads and parent threads.

@@ -11,10 +11,10 @@ use tokio::{
     io::{AsyncReadExt, AsyncSeekExt},
 };
 
-use tracing::debug;
+use tracing::{debug, info, warn};
 
 /// A data structure representing information for downloading a file from a `.torrent` file.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Download {
     /// The location of the file being downloaded
     pub name: PathBuf,
@@ -108,31 +108,37 @@ impl Download {
 }
 
 #[allow(unreachable_code)]
-pub async fn watch_download(
-    mut download: Download,
+pub async fn monitor_file_progress(
+    download: &mut Download,
     tx: tokio::sync::broadcast::Sender<ThreadUpdate>,
     mut rx: tokio::sync::broadcast::Receiver<ThreadUpdate>,
 ) -> anyhow::Result<()> {
     loop {
-        match rx.recv().await.unwrap() {
-            ThreadUpdate::Downloaded(piece, block) => {
+        match rx.recv().await {
+            Ok(ThreadUpdate::Downloaded(piece, block)) => {
                 debug!("downloaded piece={piece} block={block}");
-                let changed = download
-                    .update_downloads()
-                    .await
-                    .expect("couldn't update download state");
+                let changed = download.update_downloads().await?;
                 debug!("changed pieces={changed:?}");
                 for changed_piece in changed {
-                    tx.send(ThreadUpdate::Completed(changed_piece as u32))
-                        .expect("couldn't send");
+                    tx.send(ThreadUpdate::Completed(changed_piece as u32))?;
                 }
                 if download.is_downloaded() {
-                    break;
+                    tx.send(ThreadUpdate::FileComplete)?;
                 }
             }
-            ThreadUpdate::Completed(_piece) => continue,
-            ThreadUpdate::FileComplete => break,
+            Ok(ThreadUpdate::Completed(_)) => {
+                continue;
+            }
+            Ok(ThreadUpdate::FileComplete) => {
+                info!("file complete received");
+                break;
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                warn!("watch_download: Lagged {n} messages.");
+            }
         }
     }
+    info!("watch_download: finished");
     Ok(())
 }

@@ -298,7 +298,7 @@ pub enum MessageId {
 }
 
 impl TryFrom<u8> for MessageId {
-    type Error = ();
+    type Error = anyhow::Error;
     fn try_from(val: u8) -> Result<Self, Self::Error> {
         match val {
             0 => Ok(MessageId::Choke),
@@ -311,7 +311,7 @@ impl TryFrom<u8> for MessageId {
             7 => Ok(MessageId::Piece),
             8 => Ok(MessageId::Cancel),
             9 => Ok(MessageId::Port),
-            _ => Err(()),
+            _ => Err(anyhow::anyhow!("Invalid MessageId")),
         }
     }
 }
