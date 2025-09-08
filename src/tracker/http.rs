@@ -5,7 +5,7 @@ use crate::{parsing::Metadata, peer::Peer};
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer};
 
-use anyhow::Result;
+use anyhow::{Result, Context};
 use tokio::net::TcpListener;
 use tracing::error;
 
@@ -114,7 +114,7 @@ pub fn create_tracker_url(metadata: &Metadata, listener: &TcpListener) -> Result
         "http" | "https" => {}
         _ => {
             error!("invalid scheme");
-            return Err(anyhow::Error::msg("Invalid Scheme".to_string()));
+            anyhow::bail!("Invalid Scheme".to_string());
         }
     }
     let peer_id: [u8; 20] = std::env::var("USER_PEER_ID")
@@ -158,11 +158,10 @@ pub fn create_tracker_url(metadata: &Metadata, listener: &TcpListener) -> Result
 }
 
 pub async fn make_request(metadata: &Metadata, listener: &TcpListener) -> anyhow::Result<Response> {
-    let announce = create_tracker_url(metadata, listener).expect("valid tracker URL");
+    let announce = create_tracker_url(metadata, listener).context("Invalid tracker URL.")?;
 
-    // let announce = reqwest::Url::parse_with_params(announce.as_str(), params).expect("unable to create tracker URL");
-    let res = reqwest::get(announce).await.expect("invalid tracker URL");
-    let body = res.bytes().await.expect("error reading body");
+    let res = reqwest::get(announce).await.context("Unable to reach tracker.")?;
+    let body = res.bytes().await.context("Couldn't read tracker response.")?;
 
     Ok(serde_bencode::from_bytes(&body)?)
 }

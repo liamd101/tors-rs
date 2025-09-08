@@ -67,12 +67,12 @@ impl Client {
     }
 
     async fn discover_peers(&self) -> Result<Vec<Peer>> {
-        let res = tracker::make_request(&self.metadata, &self.listener)
+        let res = tracker::http::make_request(&self.metadata, &self.listener)
             .await
             .context("Unable to contact tracker.")?;
         match res {
-            tracker::Response::Success { peers, .. } => Ok(peers.0),
-            tracker::Response::Error { failure_reason } => {
+            tracker::http::Response::Success { peers, .. } => Ok(peers.0),
+            tracker::http::Response::Error { failure_reason } => {
                 anyhow::bail!("Making request to tracker failed: {failure_reason}")
             }
         }
