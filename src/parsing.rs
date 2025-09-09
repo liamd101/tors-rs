@@ -3,6 +3,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha1::{Digest, Sha1};
 use std::fmt;
 
+use anyhow::Context;
+
 #[allow(dead_code)]
 #[derive(Debug, Deserialize, Clone)]
 pub struct Metadata {
@@ -43,11 +45,12 @@ impl Metadata {
         (self.info.torr_type.len() as usize).div_ceil(self.info.piece_length as usize)
     }
 
-    pub fn info_hash(&self) -> [u8; 20] {
-        let serialized = serde_bencode::to_bytes(&self.info).expect("could not serialize metadata");
+    pub fn info_hash(&self) -> anyhow::Result<[u8; 20]> {
+        let serialized =
+            serde_bencode::to_bytes(&self.info).context("could not serialize metadata")?;
         let mut hasher = Sha1::new();
         hasher.update(serialized);
-        hasher.finalize().into()
+        Ok(hasher.finalize().into())
     }
 
     pub fn new(file: &String) -> anyhow::Result<Self> {
