@@ -1,35 +1,39 @@
-use crate::parsing::Metadata;
+use crate::{
+    parsing::Metadata,
+    peer::Peer,
+};
 
 use std::net::SocketAddrV4;
 
-use tokio::net::TcpListener;
 use tokio_util::bytes::{Buf, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
 
-use anyhow::Context;
+use anyhow::{Context, Result};
 
+#[allow(dead_code)]
 #[repr(u32)]
 #[derive(Debug, Copy, Clone)]
-enum Action {
+pub(crate) enum Action {
     Connect = 0,
     Announce = 1,
     Scrape = 2,
-    ErrorAct = 3,
+    Error = 3,
 }
 impl TryFrom<u32> for Action {
     type Error = anyhow::Error;
 
-    fn try_from(val: u32) -> anyhow::Result<Self, Self::Error> {
+    fn try_from(val: u32) -> anyhow::Result<Self> {
         match val {
             0 => Ok(Self::Connect),
             1 => Ok(Self::Announce),
             2 => Ok(Self::Scrape),
-            3 => Ok(Self::ErrorAct),
+            3 => Ok(Action::Error),
             _ => anyhow::bail!("Invalid action received."),
         }
     }
 }
 
+#[allow(dead_code)]
 #[repr(u32)]
 #[derive(Debug, Copy, Clone)]
 enum Event {
@@ -39,8 +43,9 @@ enum Event {
     Stopped = 3,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Copy, Clone)]
-enum Request {
+pub(crate) enum Request {
     Connect {
         /// 0x41727101980
         protocol_id: u64,
@@ -65,30 +70,31 @@ enum Request {
 }
 
 impl Request {
+    /// Creates a new Request::Connect object with a random transaction ID.
     pub fn connect() -> Self {
         Self::Connect {
             protocol_id: 0x41727101980,
             action: Action::Connect,
-            transaction_id: 0, // TODO
+            transaction_id: rand::random(),
         }
     }
 
-    pub fn announce(connection_id: u64, metadata: &Metadata, listener_addr: SocketAddrV4) -> Self {
-        Self::AnnounceV4 {
+    pub fn announce(connection_id: u64, metadata: &Metadata, peer_id: [u8; 20], listener_addr: SocketAddrV4) -> anyhow::Result<Self> {
+        Ok(Self::AnnounceV4 {
             connection_id,
             action: Action::Announce,
-            transaction_id: 0, /* TODO */
-            info_hash: metadata.info_hash(),
-            peer_id: todo!(),
-            downloaded: 0,
+            transaction_id: rand::random(),
+            info_hash: metadata.info_hash()?,
+            peer_id,
+            downloaded: 0, /* TODO */
             left: metadata.info.torr_type.len(),
-            uploaded: 0,
-            event: Event::Started,
+            uploaded: 0, /* TODO */
+            event: Event::Started, /* TODO */
             ip_addr: listener_addr.ip().to_bits(),
-            key: 0,
+            key: 0, /* TODO */
             num_want: -1,
             port: listener_addr.port(),
-        }
+        })
     }
 }
 
@@ -252,4 +258,6 @@ impl Decoder for ResponseDecoder {
     }
 }
 
-pub async fn get_response() {}
+pub async fn get_response(metadata: &Metadata, listener_addr: SocketAddrV4) -> Result<Vec<Peer>> {
+    todo!()
+}

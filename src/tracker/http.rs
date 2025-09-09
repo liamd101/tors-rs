@@ -5,14 +5,14 @@ use crate::{parsing::Metadata, peer::Peer};
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer};
 
-use anyhow::{Result, Context};
+use anyhow::Result;
 use tokio::net::TcpListener;
 use tracing::error;
 
 #[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
-pub enum Response {
+pub(crate) enum Response {
     /// Successful response from the tracker. Contains necessary info for communicating with peers
     Success {
         /// Similar to failure reason, but response still gets processed normally. Message is shown
@@ -50,7 +50,7 @@ pub enum Response {
 }
 
 #[derive(Debug)]
-pub struct Peers(pub Vec<Peer>);
+pub(crate) struct Peers(pub Vec<Peer>);
 
 struct PeersVisitor;
 impl<'de> Visitor<'de> for PeersVisitor {
@@ -108,7 +108,7 @@ impl std::fmt::Display for TrackerEvent {
 }
 
 /// Creates a populated Tracker URL for sending an initial request
-pub fn create_tracker_url(metadata: &Metadata, listener: &TcpListener) -> Result<String> {
+pub(crate) fn create_tracker_url(metadata: &Metadata, listener: &TcpListener) -> Result<String> {
     let announce: reqwest::Url = metadata.announce.parse()?;
     match announce.scheme() {
         "http" | "https" => {}
@@ -141,7 +141,7 @@ pub fn create_tracker_url(metadata: &Metadata, listener: &TcpListener) -> Result
         _ => unimplemented!("don't have support for multiple files yet"),
     }
 
-    let info_hash = metadata.info_hash();
+    let info_hash = metadata.info_hash()?;
     params.insert(
         "info_hash".into(),
         urlencoding::encode_binary(&info_hash).to_string(),
@@ -155,13 +155,4 @@ pub fn create_tracker_url(metadata: &Metadata, listener: &TcpListener) -> Result
         .join("&");
 
     Ok(format!("{}?{params}", metadata.announce))
-}
-
-pub async fn make_request(metadata: &Metadata, listener: &TcpListener) -> anyhow::Result<Response> {
-    let announce = create_tracker_url(metadata, listener).context("Invalid tracker URL.")?;
-
-    let res = reqwest::get(announce).await.context("Unable to reach tracker.")?;
-    let body = res.bytes().await.context("Couldn't read tracker response.")?;
-
-    Ok(serde_bencode::from_bytes(&body)?)
 }
