@@ -46,7 +46,7 @@ impl Client {
             return Ok(());
         }
 
-        let peers = self.discover_peers().await?;
+        let peers = tracker::get_peers(&self.metadata, &self.listener).await?;
         debug!("tracker supplied {} peers", peers.len());
 
         self.start_download(peers).await
@@ -57,24 +57,12 @@ impl Client {
             .await
             .expect("couldn't connect to peer");
 
-        let handshake = Handshake::v1(self.metadata.info_hash(), self.config.peer_id);
+        let handshake = Handshake::v1(self.metadata.info_hash()?, self.config.peer_id);
 
         match try_handshake(&mut stream, &handshake).await {
             Ok(true) => Ok(stream),
             Ok(false) => anyhow::bail!("Peer failed handshake"),
             Err(e) => Err(e).context("handshake error"),
-        }
-    }
-
-    async fn discover_peers(&self) -> Result<Vec<Peer>> {
-        let res = tracker::http::make_request(&self.metadata, &self.listener)
-            .await
-            .context("Unable to contact tracker.")?;
-        match res {
-            tracker::http::Response::Success { peers, .. } => Ok(peers.0),
-            tracker::http::Response::Error { failure_reason } => {
-                anyhow::bail!("Making request to tracker failed: {failure_reason}")
-            }
         }
     }
 
