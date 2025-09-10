@@ -1,10 +1,8 @@
-use crate::{
-    parsing::Metadata,
-    peer::Peer,
-};
+use crate::{parsing::Metadata, peer::Peer};
 
-use std::net::SocketAddrV4;
+use std::net::{Ipv4Addr, SocketAddrV4, ToSocketAddrs};
 
+use tokio::net::UdpSocket;
 use tokio_util::bytes::{Buf, BytesMut};
 use tokio_util::codec::{Decoder, Encoder};
 
@@ -79,7 +77,12 @@ impl Request {
         }
     }
 
-    pub fn announce(connection_id: u64, metadata: &Metadata, peer_id: [u8; 20], listener_addr: SocketAddrV4) -> anyhow::Result<Self> {
+    pub fn announce(
+        connection_id: u64,
+        metadata: &Metadata,
+        peer_id: [u8; 20],
+        listener_addr: SocketAddrV4,
+    ) -> anyhow::Result<Self> {
         Ok(Self::AnnounceV4 {
             connection_id,
             action: Action::Announce,
@@ -88,7 +91,7 @@ impl Request {
             peer_id,
             downloaded: 0, /* TODO */
             left: metadata.info.torr_type.len(),
-            uploaded: 0, /* TODO */
+            uploaded: 0,           /* TODO */
             event: Event::Started, /* TODO */
             ip_addr: listener_addr.ip().to_bits(),
             key: 0, /* TODO */
@@ -259,5 +262,17 @@ impl Decoder for ResponseDecoder {
 }
 
 pub async fn get_response(metadata: &Metadata, listener_addr: SocketAddrV4) -> Result<Vec<Peer>> {
+    let tracker_addr = reqwest::Url::parse(&metadata.announce)?;
+    let tracker_addr = format!(
+        "{}:{}",
+        tracker_addr.host_str().context("No tracker host found.")?,
+        tracker_addr.port().unwrap_or(80)
+    )
+    .to_socket_addrs()?
+    .find(|addr| addr.is_ipv4())
+    .context("Unable to find IPv4 address.")?;
+
+    let tracker_socket = UdpSocket::connect(tracker_addr).await?;
+
     todo!()
 }
