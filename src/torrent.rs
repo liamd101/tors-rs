@@ -4,7 +4,7 @@ use crate::{
     download::{Download, monitor_file_progress},
     message::BitField,
     parsing::Metadata,
-    peer::{Handshake, Peer, handle_peer, try_handshake},
+    peer::{handshake::Handshake, Peer, handle_peer, handshake::try_handshake},
     tracker,
 };
 

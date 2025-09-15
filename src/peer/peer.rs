@@ -1,8 +1,5 @@
 use std::io::SeekFrom;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, RwLock};
-
-use rand::seq::IndexedRandom;
 
 use anyhow::{Context, Error};
 
@@ -20,272 +17,7 @@ use crate::{
     parsing::Metadata,
 };
 
-const BLOCK_SIZE: u32 = 1 << 14;
-
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub struct Peer {
-    pub socket_addr: SocketAddr,
-    pub peer_id: String,
-    pub am_choking: bool,
-    pub am_interested: bool,
-    pub peer_choking: bool,
-    pub peer_interested: bool,
-}
-impl Default for Peer {
-    fn default() -> Self {
-        Self {
-            socket_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
-            am_choking: true,
-            am_interested: false,
-            peer_choking: true,
-            peer_interested: false,
-            peer_id: String::new(),
-        }
-    }
-}
-
-impl Peer {
-    pub fn new(socket_addr: SocketAddr) -> Self {
-        Self {
-            socket_addr,
-            ..Default::default()
-        }
-    }
-
-    pub fn from_bytes(b: &[u8]) -> Option<Self> {
-        if b.len() < 6 {
-            return None;
-        }
-        let ip_addr = std::net::Ipv4Addr::new(b[0], b[1], b[2], b[3]);
-        let port = u16::from_be_bytes([b[4], b[5]]);
-        Some(Peer::new(SocketAddr::new(IpAddr::V4(ip_addr), port)))
-    }
-}
-
-/// The handshake is a required message and must be the first message transmitted by the client
-/// It is (49+len(pstr)) bytes long
-#[derive(Debug, Clone)]
-pub struct Handshake {
-    /// String length of pstr as a single raw byte
-    pub pstrlen: u8,
-    /// String identifier of the protocol
-    pub pstr: String,
-    /// 8 reserved bits. All current implementations use all zeroes. Each bit in these bytes can be
-    /// used to change the behavior of the protocol
-    pub reserved: [u8; 8],
-    /// 20-byte SHA1 hash of the info key in the metainfo file. Same info_hash that is transmitted
-    /// in tracker requests
-    pub info_hash: [u8; 20],
-    /// 20-byte string used as a unique ID for the client. This is usually the same peer_id that
-    /// is transmitted in tracker requests, but not always.
-    pub peer_id: [u8; 20],
-}
-
-impl Handshake {
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let total_len = 1 + self.pstr.len() + 8 + 20 + 20;
-        let mut bytes: Vec<u8> = Vec::with_capacity(total_len);
-        bytes.push(self.pstrlen);
-        bytes.extend_from_slice(self.pstr.as_bytes());
-        bytes.extend_from_slice(&self.reserved);
-        bytes.extend_from_slice(&self.info_hash);
-        bytes.extend_from_slice(&self.peer_id);
-        bytes
-    }
-
-    pub fn from_bytes(value: &[u8]) -> Result<Self, String> {
-        if value.is_empty() {
-            return Err("Input cannot be empty".to_string());
-        }
-        let pstrlen = value[0];
-        if value.len() != 49 + (pstrlen as usize) {
-            return Err(format!("pstrlen/pstr is incorrect: {pstrlen}"));
-        }
-        let pstr = String::from_utf8_lossy(&value[1..=(pstrlen as usize)]).to_string();
-        let reserved: [u8; 8] = value[(pstrlen as usize + 1)..(pstrlen as usize + 9)]
-            .try_into()
-            .map_err(|_| "Invalid reserved field length")?;
-        let info_hash: [u8; 20] = value[(pstrlen as usize + 9)..(pstrlen as usize + 29)]
-            .try_into()
-            .map_err(|_| "Invalid info_hash field length")?;
-        let peer_id: [u8; 20] = value[(pstrlen as usize + 29)..(pstrlen as usize + 49)]
-            .try_into()
-            .map_err(|_| "Invalid peer_id field length")?;
-        Ok(Handshake {
-            pstrlen,
-            pstr,
-            reserved,
-            info_hash,
-            peer_id,
-        })
-    }
-
-    pub fn v1(info_hash: [u8; 20], peer_id: [u8; 20]) -> Self {
-        Self {
-            info_hash,
-            peer_id,
-            pstrlen: 19,
-            pstr: "BitTorrent protocol".to_string(),
-            reserved: [0u8; 8],
-        }
-    }
-}
-
-pub async fn try_handshake(
-    stream: &mut TcpStream,
-    handshake: &Handshake,
-) -> Result<bool, std::io::Error> {
-    let handshake_bytes = handshake.to_bytes();
-
-    stream.write_all(&handshake_bytes).await?;
-
-    // first read will be 68 bytes the majority of the time according to the bittorrent spec
-    let mut parts = vec![0u8; 68];
-
-    stream.read_exact(&mut parts).await?;
-
-    let peer_response = Handshake::from_bytes(&parts).expect("invalid peer response");
-    Ok(peer_response.info_hash == handshake.info_hash)
-}
-
-#[repr(u8)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BlockState {
-    UnRequested,
-    Requested,
-    Completed,
-}
-
-#[allow(dead_code)]
-struct Pieces {
-    num_total_blocks: usize,
-    num_requested: usize,
-    num_downloaded: usize,
-    pipeline_len: usize,
-    blocks: Vec<Vec<BlockState>>,
-}
-impl Pieces {
-    pub fn from_file_info(file_length: u64, piece_length: u64) -> Self {
-        let num_pieces = file_length.div_ceil(piece_length);
-        let last_piece_begin = (num_pieces - 1) * piece_length;
-        let last_piece_size = file_length - last_piece_begin;
-        let last_piece_num_blocks = last_piece_size.div_ceil(BLOCK_SIZE as u64);
-        let standard_num_blocks = piece_length.div_ceil(BLOCK_SIZE as u64);
-        let mut blocks = vec![
-            vec![BlockState::UnRequested; standard_num_blocks as usize];
-            num_pieces as usize - 1
-        ];
-        blocks.push(vec![
-            BlockState::UnRequested;
-            last_piece_num_blocks as usize
-        ]);
-        Self {
-            num_requested: 0,
-            num_downloaded: 0,
-            pipeline_len: 5,
-            num_total_blocks: ((num_pieces - 1) * standard_num_blocks + last_piece_num_blocks)
-                as usize,
-            blocks,
-        }
-    }
-
-    /// Updates `self` so that all blocks and pieces that are set true in the bitfield are set to `Completed`
-    /// in `self.blocks`
-    pub fn update(&mut self, bitfield: &BitField) {
-        for piece in bitfield.set_bits() {
-            let piece = self.blocks.get_mut(piece).unwrap();
-            piece.iter_mut().map(|b| *b = BlockState::Completed).count();
-        }
-    }
-
-    /// Returns a Vec of `(piece_idx, block_idx)` pairs for every requested (but not downloaded)
-    /// block
-    pub fn pending_requests(&self) -> Vec<(u32, u32)> {
-        let mut out = Vec::with_capacity(self.num_requested);
-        for (piece_idx, piece) in self.blocks.iter().enumerate() {
-            for (block_idx, &block) in piece.iter().enumerate() {
-                if block == BlockState::Requested {
-                    out.push((piece_idx as u32, block_idx as u32))
-                }
-            }
-        }
-        out
-    }
-
-    /// Marks a block as Completed and decrements the number of requested blocks
-    pub fn finish_request(&mut self, piece: usize, block: usize) -> Option<bool> {
-        if self.num_requested == 0 {
-            return None;
-        }
-        let piece = self.blocks.get_mut(piece)?;
-        let state = piece.get_mut(block)?;
-        match state {
-            BlockState::Completed => None,
-            _ => {
-                *state = BlockState::Completed;
-                self.num_requested -= 1;
-                Some(true)
-            }
-        }
-    }
-
-    pub fn request_new(&mut self, pieces: Vec<usize>) -> Option<(u32, u32)> {
-        if self.num_requested >= self.pipeline_len {
-            return None;
-        }
-        // want to create a Vec<(usize, usize)> where first index is in pieces and select randomly from there
-        let blocks: Vec<Vec<BlockState>> = pieces
-            .iter()
-            .map(|&piece_idx| self.blocks[piece_idx].clone())
-            .collect();
-        let blocks: Vec<Vec<usize>> = blocks
-            .iter()
-            .map(|piece| {
-                piece
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(block_idx, block_state)| match block_state {
-                        BlockState::UnRequested => Some(block_idx),
-                        _ => None,
-                    })
-                    .collect()
-            })
-            .collect();
-        let blocks: Vec<(u32, u32)> = blocks
-            .iter()
-            .enumerate()
-            .flat_map(|(piece_idx, piece)| {
-                piece
-                    .iter()
-                    .map(move |&block_idx| (piece_idx as u32, block_idx as u32))
-            })
-            .collect();
-        let out = blocks.choose(&mut rand::rng()).copied()?;
-        self.blocks[out.0 as usize][out.1 as usize] = BlockState::Requested;
-        self.num_requested += 1;
-        Some(out)
-    }
-
-    pub fn set(&mut self, piece: usize, block: usize, state: BlockState) -> Option<BlockState> {
-        let piece = self.blocks.get_mut(piece)?;
-        let old_state = piece.get_mut(block)?;
-        let out = *old_state;
-        *old_state = state;
-        Some(out)
-    }
-
-    pub fn complete_piece(&mut self, piece: u32) -> Option<bool> {
-        let piece = self.blocks.get_mut(piece as usize)?;
-        for block in piece.iter_mut() {
-            if block == &BlockState::Requested {
-                self.num_requested -= 1;
-            }
-            *block = BlockState::Completed;
-        }
-        Some(true)
-    }
-}
+use super::{BLOCK_SIZE, BlockState, pieces::PieceTracker};
 
 #[allow(unreachable_code)]
 pub async fn handle_peer(
@@ -365,20 +97,12 @@ pub async fn handle_peer(
 
     set.spawn(
         async move {
-            let mut requested: Pieces =
-                Pieces::from_file_info(metadata.info.torr_type.len(), metadata.info.piece_length);
-
             loop {
                 select! {
                 result = child_rx.recv() => {
                     match result {
                         Ok(ThreadUpdate::Downloaded(piece, block)) => {
-                            match requested.set(piece as usize, block as usize, BlockState::Completed) {
-                                None | Some(BlockState::Completed) => {},
-                                _ => {
-                                    parent_tx.send(ThreadUpdate::Downloaded(piece, block))?;
-                                },
-                            }
+                            parent_tx.send(ThreadUpdate::Downloaded(piece, block))?;
                         }
                         Ok(ThreadUpdate::FileComplete) => break,
                         Ok(_) => {},
@@ -484,7 +208,6 @@ async fn read_peer(
             }
         }
     }
-
 
     Ok(ChildUpdates::Read(stream))
 }
@@ -613,8 +336,8 @@ async fn write_peer(
     choked: Arc<RwLock<bool>>,
 ) -> Result<ChildUpdates, Error> {
     let mut am_interested = false;
-    let mut requested: Pieces =
-        Pieces::from_file_info(metadata.info.torr_type.len(), metadata.info.piece_length);
+    let mut requested =
+        PieceTracker::from_file_info(metadata.info.torr_type.len(), metadata.info.piece_length);
     requested.update(&my_bitfield.read().unwrap());
 
     loop {
