@@ -7,7 +7,7 @@ pub(crate) struct PieceTracker {
     num_requested: usize,
     pipeline_len: usize,
     blocks: Vec<Vec<BlockState>>,
-    requested_piece: Option<usize>,
+    requested: Option<usize>,
 }
 impl PieceTracker {
     pub fn from_file_info(file_length: u64, piece_length: u64) -> Self {
@@ -28,97 +28,93 @@ impl PieceTracker {
             num_requested: 0,
             pipeline_len: 5,
             blocks,
-            requested_piece: None,
+            requested: None,
         }
     }
 
     /// Updates `self` so that all blocks and pieces that are set true in the bitfield are set to `Completed`
     /// in `self.blocks`
     pub fn update(&mut self, bitfield: &BitField) {
-        for piece in bitfield.set_bits() {
-            let piece = self.blocks.get_mut(piece).unwrap();
-            piece.iter_mut().map(|b| *b = BlockState::Completed).count();
+        for piece_idx in bitfield.set_bits() {
+            let piece = self.blocks.get_mut(piece_idx).unwrap();
+            *piece = vec![BlockState::Completed; piece.len()];
         }
     }
 
-    /// Returns a Vec of `(piece_idx, block_idx)` pairs for every requested (but not downloaded)
-    /// block
-    pub fn pending_requests(&self) -> Vec<(u32, u32)> {
-        let mut out = Vec::with_capacity(self.num_requested);
-        for (piece_idx, piece) in self.blocks.iter().enumerate() {
-            for (block_idx, &block) in piece.iter().enumerate() {
-                if block == BlockState::Requested {
-                    out.push((piece_idx as u32, block_idx as u32))
-                }
-            }
-        }
-        out
-    }
-
-    /// Marks a block as Completed and decrements the number of requested blocks
-    pub fn finish_request(&mut self, piece: usize, block: usize) -> Option<bool> {
-        if self.num_requested == 0 {
-            return None;
-        }
-        let piece = self.blocks.get_mut(piece)?;
-        let state = piece.get_mut(block)?;
-        match state {
-            BlockState::Completed => None,
-            _ => {
-                *state = BlockState::Completed;
-                self.num_requested -= 1;
-                Some(true)
-            }
-        }
-    }
-
-    pub fn request_new(&mut self, pieces: Vec<usize>) -> Option<(u32, u32)> {
+    /// Requests a new (piece,block) combo.
+    /// If a piece has already been requested, but not completed, then we will first try to request
+    /// a block from that piece.
+    /// Otherwise, we will pick a new random piece and add it to a stack of pieces to request.
+    ///
+    /// if we shouldn't request a specific piece, request a random piece and update requested piece
+    pub fn request(&mut self, pieces: Vec<usize>) -> Option<(u32, u32)> {
         if self.num_requested >= self.pipeline_len {
             return None;
         }
-        // want to create a Vec<(usize, usize)> where first index is in pieces and select randomly from there
-        let blocks: Vec<Vec<BlockState>> = pieces
-            .iter()
-            .map(|&piece_idx| self.blocks[piece_idx].clone())
-            .collect();
-        let blocks: Vec<Vec<usize>> = blocks
-            .iter()
-            .map(|piece| {
-                piece
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(block_idx, block_state)| match block_state {
-                        BlockState::UnRequested => Some(block_idx),
-                        _ => None,
-                    })
-                    .collect()
-            })
-            .collect();
-        let blocks: Vec<(u32, u32)> = blocks
+
+        // If we need to request a new piece, pick a random piece and select a the first
+        // unrequested block
+        if self.requested.is_none() {
+            let requestable_pieces: Vec<usize> = pieces
+                .iter()
+                .filter_map(|&piece_idx| {
+                    let piece = self.blocks.get(piece_idx)?;
+                    piece
+                        .iter()
+                        .any(|block| block == &BlockState::UnRequested)
+                        .then_some(piece_idx)
+                })
+                .collect();
+
+            let piece_idx = requestable_pieces.choose(&mut rand::rng()).copied()?;
+            self.requested = Some(piece_idx);
+
+            let piece = self.blocks.get_mut(piece_idx)?;
+            for (block_idx, block) in piece.iter_mut().enumerate() {
+                if block == &BlockState::UnRequested {
+                    *block = BlockState::Requested;
+                    self.num_requested += 1;
+                    return Some((piece_idx as u32, block_idx as u32));
+                }
+            }
+
+            return None;
+        }
+
+        let requested = self.requested.unwrap();
+
+        let requested_piece = self.blocks.get_mut(requested)?;
+        let Some((block_idx, _)) = requested_piece
             .iter()
             .enumerate()
-            .flat_map(|(piece_idx, piece)| {
-                piece
-                    .iter()
-                    .map(move |&block_idx| (piece_idx as u32, block_idx as u32))
-            })
-            .collect();
-        let out = blocks.choose(&mut rand::rng()).copied()?;
-        self.blocks[out.0 as usize][out.1 as usize] = BlockState::Requested;
+            .find(|&(_, block)| block == &BlockState::UnRequested)
+        else {
+            // if we have requested all blocks of a piece, then we want to find a new piece to
+            // request blocks from
+            self.requested = None;
+            return self.request(pieces);
+        };
+
+        requested_piece[block_idx] = BlockState::Requested;
         self.num_requested += 1;
-        Some(out)
+        Some((requested as u32, block_idx as u32))
     }
 
-    pub fn set(&mut self, piece: usize, block: usize, state: BlockState) -> Option<BlockState> {
+    pub fn mark_block_as_downloaded(&mut self, piece: usize, block: usize) -> Option<bool> {
         let piece = self.blocks.get_mut(piece)?;
-        let old_state = piece.get_mut(block)?;
-        let out = *old_state;
-        *old_state = state;
-        Some(out)
+        let block = piece.get_mut(block)?;
+        if block == &BlockState::Requested {
+            self.num_requested -= 1;
+        }
+        *block = BlockState::Completed;
+        Some(true)
     }
 
-    pub fn complete_piece(&mut self, piece: u32) -> Option<bool> {
-        let piece = self.blocks.get_mut(piece as usize)?;
+    // have a function to request a new block
+    // need a function to mark a block as downloaded so we can download a new piece
+    // probably a better name for this function
+    pub fn mark_piece_as_downloaded(&mut self, piece: usize) -> Option<bool> {
+        let piece = self.blocks.get_mut(piece)?;
         for block in piece.iter_mut() {
             if block == &BlockState::Requested {
                 self.num_requested -= 1;
@@ -127,90 +123,16 @@ impl PieceTracker {
         }
         Some(true)
     }
-}
 
-impl PieceTracker {
-    /// Requests a new (piece,block) combo.
-    /// If a piece has already been requested, but not completed, then we will first try to request
-    /// a blcok from that piece.
-    /// Otherwise, we will pick a new random piece and add it to a stack of pieces to request.
-    ///
-    /// check if we can request another piece (i.e. not at pipeline limit)
-    /// if we can, we want to check if we should request from a specific piece.
-    /// if we should request from a specific piece, try to find a block to request, otherwise,
-    /// request a random block and update the requested piece
-    ///
-    /// if we shouldn't request a specific piece, request a random piece and update requested piece
-    pub fn request(&mut self, pieces: Vec<usize>) -> Option<(usize, usize)> {
-        if self.num_requested >= self.pipeline_len {
-            return None;
-        }
-
-        match self.requested_piece {
-            Some(piece) => {
-                if self.all_requested(piece)? {
-                    self.requested_piece = None;
-                } else {
+    pub fn pending_requests(&self) -> Vec<(u32, u32)> {
+        let mut requests = Vec::with_capacity(self.num_requested);
+        for (piece_idx, piece) in self.blocks.iter().enumerate() {
+            for (block_idx, block) in piece.iter().enumerate() {
+                if block == &BlockState::Requested {
+                    requests.push((piece_idx as u32, block_idx as u32));
                 }
             }
-            None => {}
         }
-
-        // self.requested_piece = Some(piece /* TODO */);
-        todo!()
-    }
-
-    fn get_unrequested_block(&self, pieces: Vec<usize>) -> Option<(usize, usize)> {
-        let blocks: Vec<Vec<BlockState>> = pieces
-            .iter()
-            .map(|&piece_idx| self.blocks[piece_idx].clone())
-            .collect();
-
-        let blocks: Vec<Vec<usize>> = blocks
-            .iter()
-            .map(|piece| {
-                piece
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(block_idx, block_state)| match block_state {
-                        BlockState::UnRequested => Some(block_idx),
-                        _ => None,
-                    })
-                    .collect()
-            })
-            .collect();
-
-        let blocks: Vec<(usize, usize)> = blocks
-            .iter()
-            .enumerate()
-            .flat_map(|(piece_idx, piece)| {
-                piece.iter().map(move |&block_idx| (piece_idx, block_idx))
-            })
-            .collect();
-
-        blocks.choose(&mut rand::rng()).copied()
-    }
-
-    /// Marks the provided block as downloaded.
-    /// If the piece has been completely downloaded, then we remove it from the queue of requested
-    /// pieces
-    ///
-    /// Returns Some(()) on success. None on failure
-    pub fn download(&mut self, piece: usize, block: usize) -> Option<()> {
-        let piece_vec = self.blocks.get_mut(piece)?;
-        let block_state = piece_vec.get_mut(block)?;
-        *block_state = BlockState::Completed;
-        if self.all_requested(piece)? {
-            self.requested_piece = None;
-        }
-        Some(())
-    }
-
-    /// Returns a Some(true) if all blocks of a piece have been requested/downloaded
-    ///           Some(false) if there is a block that has not been requested yet
-    ///           None if the piece does not exist (although this should never be the case)
-    fn all_requested(&self, piece: usize) -> Option<bool> {
-        let piece = self.blocks.get(piece)?;
-        Some(piece.iter().any(|b| b == &BlockState::UnRequested))
+        requests
     }
 }

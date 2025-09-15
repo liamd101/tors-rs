@@ -17,7 +17,7 @@ use crate::{
     parsing::Metadata,
 };
 
-use super::{BLOCK_SIZE, BlockState, pieces::PieceTracker};
+use super::{BLOCK_SIZE, pieces::PieceTracker};
 
 #[allow(unreachable_code)]
 pub async fn handle_peer(
@@ -352,13 +352,13 @@ async fn write_peer(
             }
             Err(broadcast::error::TryRecvError::Empty) => {}
             Ok(ThreadUpdate::Downloaded(piece, block)) => {
-                match requested.finish_request(piece as usize, block as usize) {
+                match requested.mark_block_as_downloaded(piece as usize, block as usize) {
                     Some(_) => debug!("updated requested pieces"),
                     None => warn!("unable to process piece={piece} block={block}"),
                 }
             }
             Ok(ThreadUpdate::Completed(piece)) => {
-                requested.complete_piece(piece);
+                requested.mark_piece_as_downloaded(piece as usize);
                 let message = Message::have();
                 info!("sending message: {message:?}");
 
@@ -442,7 +442,7 @@ async fn write_peer(
         }
 
         let peer_has = peer_bitfield.read().unwrap().set_bits();
-        if !choked && let Some((piece, block_num)) = requested.request_new(peer_has) {
+        if !choked && let Some((piece, block_num)) = requested.request(peer_has) {
             let message = Message::request();
             debug!("sending message: {message:?}");
             stream
