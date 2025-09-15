@@ -19,7 +19,6 @@ use crate::{
 
 use super::{BLOCK_SIZE, pieces::PieceTracker};
 
-#[allow(unreachable_code)]
 pub async fn handle_peer(
     parent_tx: broadcast::Sender<ThreadUpdate>,
     mut parent_rx: broadcast::Receiver<ThreadUpdate>,

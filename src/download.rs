@@ -107,7 +107,6 @@ impl Download {
     }
 }
 
-#[allow(unreachable_code)]
 pub async fn monitor_file_progress(
     download: &mut Download,
     tx: tokio::sync::broadcast::Sender<ThreadUpdate>,

@@ -9,7 +9,6 @@ use anyhow::Result;
 use tokio::net::TcpListener;
 use tracing::error;
 
-#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 pub enum Response {
