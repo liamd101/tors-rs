@@ -1,6 +1,6 @@
 pub mod handshake;
-mod peer;
-pub use peer::handle_peer;
+mod connection;
+pub use connection::handle_peer;
 mod pieces;
 
 #[derive(Debug, Clone)]
