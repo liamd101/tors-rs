@@ -2,6 +2,7 @@ pub mod handshake;
 mod connection;
 pub use connection::handle_peer;
 mod pieces;
+mod message;
 
 #[derive(Debug, Clone)]
 pub struct Peer {

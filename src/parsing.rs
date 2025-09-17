@@ -54,6 +54,71 @@ impl Metadata {
         let data: &[u8] = &std::fs::read(file)?;
         Ok(serde_bencode::from_bytes(data)?)
     }
+
+    /// Takes in information about where we are starting a read, and how much data we are reading.
+    /// Returns a list where each entry contains the File information, the offset into the file to
+    /// read to, and the number of bytes to read to that file.
+    pub fn from_piece_block(
+        &self,
+        piece_idx: u64,
+        begin: u64,
+        data_len: u64,
+    ) -> anyhow::Result<Vec<(File, u64, u64)>> {
+        let p_length = self.info.piece_length;
+        let piece_start = piece_idx * p_length;
+        let block_start = piece_start + begin;
+        let block_end = piece_start + data_len;
+
+        if piece_start >= self.info.torr_type.len() {
+            anyhow::bail!("Invalid piece index.");
+        }
+
+        if block_end > self.info.torr_type.len() {
+            anyhow::bail!("Block extends beyond torrent data.");
+        }
+
+        match &self.info.torr_type {
+            &FileTypes::SingleFile { length, .. } => {
+                let path: Vec<String> = self
+                    .info
+                    .name
+                    .split(std::path::MAIN_SEPARATOR)
+                    .map(|s| s.to_string())
+                    .collect();
+
+                let bytes_to_read = std::cmp::min(data_len as u64, length - block_start);
+
+                Ok(vec![(File { length, path }, block_start, bytes_to_read)])
+            }
+            FileTypes::MultiFile { files } => {
+                let mut out = Vec::new();
+                let mut seen_length = 0;
+
+                for file in files {
+                    let file_start = seen_length;
+                    let file_end = seen_length + file.length;
+
+                    // Check if this file contains any part of the block
+                    if block_start < file_end && file_start < block_end {
+                        let offset_in_file = if block_start > file_start {
+                            block_start - file_start
+                        } else {
+                            0
+                        };
+
+                        let read_start_in_torrent = std::cmp::max(block_start, file_start);
+                        let read_end_in_torrent = std::cmp::min(block_end, file_end);
+                        let bytes_to_read = read_end_in_torrent - read_start_in_torrent;
+
+                        out.push((file.clone(), offset_in_file, bytes_to_read));
+                    }
+
+                    seen_length += file.length;
+                }
+                Ok(out)
+            }
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -140,7 +205,7 @@ impl Serialize for Hashes {
 pub enum FileTypes {
     SingleFile {
         /// The length of the file in bytes
-        length: usize,
+        length: u64,
 
         ///  a 32-character hexadecimal string corresponding to the MD5 sum of the file. This is
         ///  not used by BitTorrent at all, but it is included by some programs for greater
@@ -167,9 +232,9 @@ impl FileTypes {
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct File {
     /// The length of the file in bytes
-    length: usize,
+    pub(crate) length: u64,
 
     /// A list of UTF-8 encoded strings corresponding to subdirectory names, the last of which is
     /// the actual file name (a zero length list is an error case).
-    path: Vec<String>,
+    pub(crate) path: Vec<String>,
 }

@@ -11,13 +11,13 @@ use tokio::task::JoinSet;
 
 use tracing::{Instrument, debug, error, info, warn};
 
-use crate::{
-    ThreadUpdate,
-    message::{BitField, Message, MessageId},
-    parsing::Metadata,
-};
+use crate::{ThreadUpdate, message::BitField, parsing::Metadata};
 
-use super::{BLOCK_SIZE, pieces::PieceTracker};
+use super::{
+    BLOCK_SIZE,
+    message::{Message, MessageId},
+    pieces::PieceTracker,
+};
 
 pub async fn handle_peer(
     parent_tx: broadcast::Sender<ThreadUpdate>,
@@ -30,7 +30,6 @@ pub async fn handle_peer(
 
     let num_pieces: u64 = metadata.num_pieces() as u64;
 
-    // TODO: this will definitely need to be redone with mrsw design
     let peer_bitfield = Arc::new(RwLock::new(BitField::with_settable(num_pieces)));
     let choked = Arc::new(RwLock::new(true));
 
@@ -40,7 +39,6 @@ pub async fn handle_peer(
     let (child_tx, mut child_rx) = broadcast::channel::<ThreadUpdate>(32);
 
     let current_span = tracing::Span::current();
-
     let read_tx = child_tx.clone();
     let read_rx = child_tx.subscribe();
     let read_metadata = metadata.clone();
@@ -253,36 +251,41 @@ async fn process_message(
         MessageId::Piece => {
             let piece_index: u32 = stream.read_u32().await.context("reading piece index")?;
             let begin: u32 = stream.read_u32().await.context("reading block offset")?;
+            let data_len: u32 = message.length - 9;
             info!("receiving piece={piece_index} offset={begin}");
-            let mut file = tokio::fs::File::options()
-                .create(true)
-                .write(true)
-                .truncate(false)
-                .open(&metadata.info.name)
-                .await
-                .with_context(|| "opening output file")?;
 
-            let current_len = file.metadata().await?.len();
-            if current_len != 0 {
-                file.set_len(metadata.info.torr_type.len()).await?;
+            for (file, file_offset, bytes_to_read) in
+                metadata.from_piece_block(piece_index as u64, begin as u64, data_len as u64)?
+            {
+                let filename = file.path.join(std::path::MAIN_SEPARATOR_STR);
+                let mut out_file = tokio::fs::File::options()
+                    .create(true)
+                    .write(true)
+                    .truncate(false)
+                    .open(&filename)
+                    .await
+                    .with_context(|| "opening output file")?;
+                if out_file.metadata().await?.len() == 0 {
+                    out_file.set_len(file.length).await?;
+                }
+                out_file
+                    .seek(SeekFrom::Start(file_offset))
+                    .await
+                    .with_context(|| "seeking to {file_offset}")?;
+                let mut piece_data = vec![0u8; bytes_to_read as usize];
+                let bytes_read = stream
+                    .read_exact(&mut piece_data)
+                    .await
+                    .context("reading piece data")?;
+                out_file
+                    .write_all(&piece_data)
+                    .await
+                    .context("writing piece data to file")?;
+                debug!(
+                    "filename={}: wrote {bytes_read} bytes to {}",
+                    filename, file_offset
+                );
             }
-
-            let piece_start = piece_index as u64 * metadata.info.piece_length;
-            file.seek(SeekFrom::Start(piece_start + begin as u64))
-                .await
-                .with_context(|| "seeking to {piece_start}")?;
-
-            let mut piece_data = vec![0u8; message.length as usize - 9];
-            let bytes_read = stream
-                .read_exact(&mut piece_data)
-                .await
-                .context("reading piece data")?;
-            file.write_all(&piece_data)
-                .await
-                .context("writing piece data to file")?;
-
-            debug!("wrote {bytes_read} bytes to {}", piece_start + begin as u64);
-
             tx.send(ThreadUpdate::Downloaded(piece_index, begin / BLOCK_SIZE))?;
         }
 
