@@ -1459,7 +1459,6 @@ dependencies = [
  "serde_bencode",
  "sha1",
  "tokio",
- "tokio-util",
  "tracing",
  "tracing-subscriber",
  "urlencoding",

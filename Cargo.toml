@@ -23,7 +23,6 @@ serde = { version = "1.0.219", features = ["derive"] }
 serde_bencode = "0.2.4"
 sha1 = "0.10.6"
 tokio = { version = "1.47.1", features = ["fs", "macros", "rt", "rt-multi-thread"] }
-tokio-util = { version = "0.7.16", features = ["codec"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 urlencoding = "2.1.3"
