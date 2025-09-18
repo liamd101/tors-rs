@@ -14,7 +14,7 @@ pub struct Metadata {
     /// This is an extention to the official specification, offering backwards-compatibility. (list
     /// of lists of strings)
     #[serde(rename = "announce list")]
-    announce_list: Option<Vec<String>>,
+    pub announce_list: Option<Vec<String>>,
 
     /// A dictionary that describes the file(s) of the torrent.
     /// There are two possible forms: one for the case of a 'single-file' torrent with no directory
@@ -86,7 +86,7 @@ impl Metadata {
                     .map(|s| s.to_string())
                     .collect();
 
-                let bytes_to_read = std::cmp::min(data_len as u64, length - block_start);
+                let bytes_to_read = std::cmp::min(data_len, length - block_start);
 
                 Ok(vec![(File { length, path }, block_start, bytes_to_read)])
             }
@@ -100,17 +100,12 @@ impl Metadata {
 
                     // Check if this file contains any part of the block
                     if block_start < file_end && file_start < block_end {
-                        let offset_in_file = if block_start > file_start {
-                            block_start - file_start
-                        } else {
-                            0
-                        };
-
+                        let seek_offset = block_start.saturating_sub(file_start);
                         let read_start_in_torrent = std::cmp::max(block_start, file_start);
                         let read_end_in_torrent = std::cmp::min(block_end, file_end);
                         let bytes_to_read = read_end_in_torrent - read_start_in_torrent;
 
-                        out.push((file.clone(), offset_in_file, bytes_to_read));
+                        out.push((file.clone(), seek_offset, bytes_to_read));
                     }
 
                     seen_length += file.length;
@@ -219,8 +214,8 @@ pub enum TorrentType {
 impl TorrentType {
     pub fn len(&self) -> u64 {
         match self {
-            &Self::SingleFile { length, .. } => length as u64,
-            Self::MultiFile { files } => files.iter().map(|f| f.length as u64).sum(),
+            &Self::SingleFile { length, .. } => length,
+            Self::MultiFile { files } => files.iter().map(|f| f.length).sum(),
         }
     }
 

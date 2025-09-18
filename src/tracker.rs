@@ -5,9 +5,8 @@ use crate::{parsing::Metadata, peer::Peer};
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use tokio::net::TcpListener;
-use tracing::error;
 
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
@@ -106,22 +105,13 @@ impl std::fmt::Display for TrackerEvent {
     }
 }
 
-/// Creates a populated Tracker URL for sending an initial request
-pub fn create_tracker_url(metadata: &Metadata, listener: &TcpListener) -> Result<String> {
-    let announce: reqwest::Url = metadata.announce.parse()?;
-    match announce.scheme() {
-        "http" | "https" => {}
-        _ => {
-            error!("invalid scheme");
-            return Err(anyhow::Error::msg("Invalid Scheme".to_string()));
-        }
-    }
+fn format_tracker_params(metadata: &Metadata, listener: &TcpListener) -> anyhow::Result<String> {
     let peer_id: [u8; 20] = std::env::var("USER_PEER_ID")
         .expect("USER_PEER_ID must be set.")
         .as_bytes()
         .try_into()
-        .expect("invalid USER_PEER_ID.");
-    let port = listener.local_addr().expect("getting addr").port();
+        .context("invalid USER_PEER_ID.")?;
+    let port = listener.local_addr().context("getting addr")?.port();
 
     let mut params: HashMap<String, String> = HashMap::new();
     params.insert("port".into(), format!("{port}"));
@@ -133,12 +123,7 @@ pub fn create_tracker_url(metadata: &Metadata, listener: &TcpListener) -> Result
         "peer_id".into(),
         urlencoding::encode_binary(&peer_id).to_string(),
     );
-    match metadata.info.torr_type {
-        crate::parsing::TorrentType::SingleFile { length, .. } => {
-            params.insert("left".into(), format!("{length}"));
-        }
-        _ => unimplemented!("don't have support for multiple files yet"),
-    }
+    params.insert("left".into(), format!("{}", metadata.info.torr_type.len()));
 
     let info_hash = metadata.info_hash();
     params.insert(
@@ -153,15 +138,40 @@ pub fn create_tracker_url(metadata: &Metadata, listener: &TcpListener) -> Result
         .collect::<Vec<String>>()
         .join("&");
 
-    Ok(format!("{}?{params}", metadata.announce))
+    Ok(params)
 }
 
 pub async fn make_request(metadata: &Metadata, listener: &TcpListener) -> anyhow::Result<Response> {
-    let announce = create_tracker_url(metadata, listener).expect("valid tracker URL");
+    let http_params = format_tracker_params(metadata, listener)?;
 
-    // let announce = reqwest::Url::parse_with_params(announce.as_str(), params).expect("unable to create tracker URL");
-    let res = reqwest::get(announce).await.expect("invalid tracker URL");
-    let body = res.bytes().await.expect("error reading body");
+    match &metadata.announce_list {
+        Some(announce_list) => {
+            for announce in announce_list {
+                let announce: reqwest::Url = announce.parse().context("couldn't parse into URL")?;
 
-    Ok(serde_bencode::from_bytes(&body)?)
+                match announce.scheme() {
+                    "http" | "https" => continue,
+                    _ => {}
+                }
+                let announce = format!("{}?{}", announce, http_params);
+                let res = reqwest::get(announce)
+                    .await
+                    .context("invalid tracker URL")?;
+                let body = res.bytes().await.context("error reading body")?;
+
+                return Ok(serde_bencode::from_bytes(&body)?);
+            }
+        }
+        None => {
+            let announce = format!("{}?{}", metadata.announce, http_params);
+            let res = reqwest::get(announce)
+                .await
+                .context("invalid tracker URL")?;
+            let body = res.bytes().await.context("error reading body")?;
+
+            return Ok(serde_bencode::from_bytes(&body)?);
+        }
+    }
+
+    Err(anyhow::anyhow!("No valid URLs found"))
 }
