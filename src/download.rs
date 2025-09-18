@@ -14,7 +14,7 @@ use anyhow::{Context, Result};
 use bytes::{Bytes, BytesMut};
 use sha1::{Digest, Sha1};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
-use tracing::{debug, info, warn};
+use tracing::{debug, info, instrument, warn};
 
 /// A data structure representing information for downloading a file from a `.torrent` file.
 #[derive(Debug, Clone)]
@@ -50,7 +50,17 @@ impl Download {
                     .collect();
                 vec![File { length, path }]
             }
-            TorrentType::MultiFile { files } => files.clone(),
+            TorrentType::MultiFile { files } => files
+                .iter()
+                .map(|file| {
+                    let mut path = vec![metadata.info.name.clone()];
+                    path.extend_from_slice(&file.path);
+                    File {
+                        length: file.length,
+                        path,
+                    }
+                })
+                .collect(),
         };
 
         let mut out = Self {
@@ -63,8 +73,33 @@ impl Download {
             files,
         };
 
+        out.initialize_files().await?;
         out.update_downloads().await?;
         Ok(out)
+    }
+
+    async fn initialize_files(&self) -> Result<()> {
+        for file in &self.files {
+            let path = file.path.iter().collect::<PathBuf>();
+            if let Some(parent) = path.parent() {
+                tokio::fs::create_dir_all(parent)
+                    .await
+                    .context("Failed to create directories for {parent:?}")?;
+            }
+            let file_handle = tokio::fs::File::options()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(&path)
+                .await
+                .context("Failed to initialize file {path:?}")?;
+            if file_handle.metadata().await?.len() == 0 {
+                file_handle.set_len(file.length).await?;
+                debug!("initialized file {path:?} (size: {})", file.length);
+            }
+        }
+        Ok(())
     }
 
     pub fn is_downloaded(&self) -> bool {
@@ -115,11 +150,7 @@ impl Download {
             let file_end = seen_length + file.length;
 
             if piece_start < file_end && file_start < piece_end {
-                let seek_offset = if piece_start > file_start {
-                    piece_start - file_start
-                } else {
-                    0
-                };
+                let seek_offset = piece_start.saturating_sub(file_start);
                 let read_start_in_torrent = std::cmp::max(piece_start, file_start);
                 let read_end_in_torrent = std::cmp::min(piece_end, file_end);
                 let bytes_to_read = read_end_in_torrent - read_start_in_torrent;
@@ -160,6 +191,7 @@ impl Download {
     }
 }
 
+#[instrument(skip(download, tx, rx))]
 pub async fn monitor_file_progress(
     download: &mut Download,
     tx: tokio::sync::broadcast::Sender<ThreadUpdate>,
@@ -187,10 +219,9 @@ pub async fn monitor_file_progress(
             }
             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                warn!("watch_download: Lagged {n} messages.");
+                warn!("Lagged {n} messages.");
             }
         }
     }
-    info!("watch_download: finished");
     Ok(())
 }
