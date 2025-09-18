@@ -1,16 +1,19 @@
+use crate::{
+    ThreadUpdate,
+    message::BitField,
+    parsing::Hashes,
+    parsing::Metadata,
+    parsing::{File, TorrentType},
+};
+
 use std::io::SeekFrom;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
-use crate::{ThreadUpdate, message::BitField, parsing::Hashes, parsing::Metadata};
-
-use anyhow::Result;
+use anyhow::{Context, Result};
+use bytes::{Bytes, BytesMut};
 use sha1::{Digest, Sha1};
-use tokio::{
-    fs::File,
-    io::{AsyncReadExt, AsyncSeekExt},
-};
-
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tracing::{debug, info, warn};
 
 /// A data structure representing information for downloading a file from a `.torrent` file.
@@ -20,6 +23,9 @@ pub struct Download {
     pub name: PathBuf,
     piece_length: u64,
     length: u64,
+
+    files: Vec<File>,
+
     /// The number of pieces in the file being downloaded
     num_pieces: usize,
     /// The piece hashes of the torrent file being downloaded. Derived from the `.torrent` file
@@ -34,6 +40,18 @@ impl Download {
     pub async fn new(metadata: &Metadata) -> anyhow::Result<Self> {
         let num_pieces = metadata.num_pieces();
         let bitfield = Arc::new(RwLock::new(BitField::with_settable(num_pieces as u64)));
+        let files = match &metadata.info.torr_type {
+            &TorrentType::SingleFile { length, .. } => {
+                let path: Vec<String> = metadata
+                    .info
+                    .name
+                    .split(std::path::MAIN_SEPARATOR)
+                    .map(|s| s.to_string())
+                    .collect();
+                vec![File { length, path }]
+            }
+            TorrentType::MultiFile { files } => files.clone(),
+        };
 
         let mut out = Self {
             name: PathBuf::from(&metadata.info.name),
@@ -42,7 +60,9 @@ impl Download {
             num_pieces,
             piece_hashes: metadata.info.pieces.clone(),
             bitfield,
+            files,
         };
+
         out.update_downloads().await?;
         Ok(out)
     }
@@ -53,32 +73,14 @@ impl Download {
 
     /// Iterates through all pieces of the file, computes their SHA1 hash, and then sets their
     /// correspondign bits in the BitField to true/false accordingly
-    pub async fn update_downloads(&mut self) -> Result<Vec<usize>, std::io::Error> {
-        let mut file: File = tokio::fs::File::options()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&self.name)
-            .await?;
-
-        if file.metadata().await?.len() == 0 {
-            file.set_len(self.length).await?;
-            return Ok(vec![]); /* no need to check pieces since the file has not been written to */
-        }
-
+    pub async fn update_downloads(&mut self) -> Result<Vec<usize>> {
         let mut changed = vec![];
 
         for piece in 0..self.num_pieces {
-            let piece_len = if piece == (self.num_pieces - 1) {
-                self.length % self.piece_length
-            } else {
-                self.piece_length
-            };
-            let mut piece_data: Vec<u8> = vec![0u8; piece_len as usize];
-            file.seek(SeekFrom::Start(self.piece_length * piece as u64))
-                .await?;
-            file.read_exact(&mut piece_data).await?;
+            let piece_data = self
+                .get_piece_data(piece as u64)
+                .await
+                .context("Couldn't get piece data.")?;
 
             let mut hasher = Sha1::new();
             hasher.update(piece_data);
@@ -102,6 +104,57 @@ impl Download {
         Ok(changed)
     }
 
+    async fn get_piece_data(&self, piece_idx: u64) -> Result<Bytes> {
+        let piece_start = piece_idx * self.piece_length;
+        let piece_end = std::cmp::min(piece_start + self.piece_length, self.length);
+        let mut piece_data = BytesMut::with_capacity((piece_end - piece_start) as usize);
+
+        let mut seen_length = 0;
+        for file in &self.files {
+            let file_start = seen_length;
+            let file_end = seen_length + file.length;
+
+            if piece_start < file_end && file_start < piece_end {
+                let seek_offset = if piece_start > file_start {
+                    piece_start - file_start
+                } else {
+                    0
+                };
+                let read_start_in_torrent = std::cmp::max(piece_start, file_start);
+                let read_end_in_torrent = std::cmp::min(piece_end, file_end);
+                let bytes_to_read = read_end_in_torrent - read_start_in_torrent;
+
+                let mut file_data = tokio::fs::File::options()
+                    .create(true)
+                    .read(true)
+                    .write(true)
+                    .truncate(false)
+                    .open(file.path.join(std::path::MAIN_SEPARATOR_STR))
+                    .await
+                    .context("Couldn't open file.")?;
+                if file_data.metadata().await?.len() == 0 {
+                    file_data.set_len(file.length).await?;
+                }
+
+                file_data.seek(SeekFrom::Start(seek_offset)).await?;
+                let mut file_bytes = vec![0u8; bytes_to_read as usize];
+                file_data.read_exact(&mut file_bytes).await?;
+                piece_data.extend_from_slice(&file_bytes);
+            }
+            seen_length += file.length;
+        }
+
+        if piece_data.len() != self.piece_length as usize
+            && piece_data.len() != (self.length % self.piece_length) as usize
+        {
+            debug!("piece_data.len={}", piece_data.len());
+            debug!("piece_length={}", self.piece_length);
+            anyhow::bail!("Piece data has incorrect size.")
+        } else {
+            Ok(piece_data.freeze())
+        }
+    }
+
     pub fn bitfield(&self) -> Arc<RwLock<BitField>> {
         self.bitfield.clone()
     }
@@ -114,8 +167,8 @@ pub async fn monitor_file_progress(
 ) -> anyhow::Result<()> {
     loop {
         match rx.recv().await {
-            Ok(ThreadUpdate::Downloaded(piece, block)) => {
-                debug!("downloaded piece={piece} block={block}");
+            Ok(ThreadUpdate::Downloaded(piece, _)) => {
+                debug!("downloaded piece={piece}");
                 let changed = download.update_downloads().await?;
                 debug!("changed pieces={changed:?}");
                 for changed_piece in changed {

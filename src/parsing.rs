@@ -78,7 +78,7 @@ impl Metadata {
         }
 
         match &self.info.torr_type {
-            &FileTypes::SingleFile { length, .. } => {
+            &TorrentType::SingleFile { length, .. } => {
                 let path: Vec<String> = self
                     .info
                     .name
@@ -90,7 +90,7 @@ impl Metadata {
 
                 Ok(vec![(File { length, path }, block_start, bytes_to_read)])
             }
-            FileTypes::MultiFile { files } => {
+            TorrentType::MultiFile { files } => {
                 let mut out = Vec::new();
                 let mut seen_length = 0;
 
@@ -151,7 +151,7 @@ pub struct TorrInfo {
     /// An enum containing the distinctive attributes of the Info dictionary that correspond to a
     /// `MultiFile` .torrent file and a `SingleFile` .torrent file.
     #[serde(flatten)]
-    pub torr_type: FileTypes,
+    pub torr_type: TorrentType,
 }
 
 #[derive(Debug, Clone)]
@@ -202,7 +202,7 @@ impl Serialize for Hashes {
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(untagged)]
-pub enum FileTypes {
+pub enum TorrentType {
     SingleFile {
         /// The length of the file in bytes
         length: u64,
@@ -216,7 +216,7 @@ pub enum FileTypes {
         files: Vec<File>,
     },
 }
-impl FileTypes {
+impl TorrentType {
     pub fn len(&self) -> u64 {
         match self {
             &Self::SingleFile { length, .. } => length as u64,

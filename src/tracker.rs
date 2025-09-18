@@ -134,7 +134,7 @@ pub fn create_tracker_url(metadata: &Metadata, listener: &TcpListener) -> Result
         urlencoding::encode_binary(&peer_id).to_string(),
     );
     match metadata.info.torr_type {
-        crate::parsing::FileTypes::SingleFile { length, .. } => {
+        crate::parsing::TorrentType::SingleFile { length, .. } => {
             params.insert("left".into(), format!("{length}"));
         }
         _ => unimplemented!("don't have support for multiple files yet"),
