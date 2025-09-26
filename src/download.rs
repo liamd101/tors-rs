@@ -216,7 +216,12 @@ pub async fn monitor_file_progress(
                 }
             }
             Ok(ThreadUpdate::Completed(piece)) => {
-                info!("Downloaded piece {piece}");
+                debug!("Downloaded piece {piece}");
+                info!(
+                    "Downloaded {} out of {} pieces",
+                    download.bitvec.read().unwrap().count_ones(),
+                    download.num_pieces
+                );
             }
             Ok(ThreadUpdate::FileComplete) => {
                 info!("file complete received");
