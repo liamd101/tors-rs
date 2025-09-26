@@ -37,9 +37,10 @@ pub struct Download {
 
 impl Download {
     // TODO: update this error type to something more robust
-    pub async fn new(metadata: &Metadata) -> anyhow::Result<Self> {
+    pub async fn new(metadata: &Metadata) -> Result<Self> {
         let num_pieces = metadata.num_pieces();
         let bitfield = Arc::new(RwLock::new(BitField::with_settable(num_pieces as u64)));
+
         let files = match &metadata.info.torr_type {
             &TorrentType::SingleFile { length, .. } => {
                 let path: Vec<String> = metadata
@@ -73,7 +74,9 @@ impl Download {
             files,
         };
 
+        debug!("initializing files");
         out.initialize_files().await?;
+        debug!("checking downloaded pieces");
         out.update_downloads().await?;
         Ok(out)
     }
@@ -112,31 +115,35 @@ impl Download {
         let mut changed = vec![];
 
         for piece in 0..self.num_pieces {
-            let piece_data = self
-                .get_piece_data(piece as u64)
-                .await
-                .context("Couldn't get piece data.")?;
-
-            let mut hasher = Sha1::new();
-            hasher.update(piece_data);
-            let piece_hash: [u8; 20] = hasher.finalize().into();
-            let hash: [u8; 20] = self.piece_hashes.0[piece];
-
-            let finished_download: bool = piece_hash == hash;
-
-            let prev = self
-                .bitfield
-                .write()
-                .unwrap()
-                .set(piece, finished_download)
-                .expect("index out of bounds");
-
-            if finished_download && !prev {
+            if self.update_piece(piece).await? {
                 changed.push(piece);
             }
         }
 
         Ok(changed)
+    }
+
+    async fn update_piece(&mut self, piece: usize) -> Result<bool> {
+        let piece_data = self
+            .get_piece_data(piece as u64)
+            .await
+            .context("Couldn't get piece data.")?;
+        let mut hasher = Sha1::new();
+        hasher.update(piece_data);
+        let piece_hash: [u8; 20] = hasher.finalize().into();
+        let hash: [u8; 20] = self.piece_hashes.0[piece];
+
+        let finished_download = piece_hash == hash;
+
+        let prev = self
+            .bitfield
+            .write()
+            .unwrap()
+            .set(piece, finished_download)
+            .expect("index out of bounds");
+
+        // return whether the piece is updated or not
+        Ok(finished_download && !prev)
     }
 
     async fn get_piece_data(&self, piece_idx: u64) -> Result<Bytes> {
@@ -196,15 +203,14 @@ pub async fn monitor_file_progress(
     download: &mut Download,
     tx: tokio::sync::broadcast::Sender<ThreadUpdate>,
     mut rx: tokio::sync::broadcast::Receiver<ThreadUpdate>,
-) -> anyhow::Result<()> {
+) -> Result<()> {
     loop {
         match rx.recv().await {
             Ok(ThreadUpdate::Downloaded(piece, _)) => {
-                debug!("downloaded piece={piece}");
-                let changed = download.update_downloads().await?;
-                debug!("changed pieces={changed:?}");
-                for changed_piece in changed {
-                    tx.send(ThreadUpdate::Completed(changed_piece as u32))?;
+                let new_download = download.update_piece(piece as usize).await?;
+                if new_download {
+                    debug!("piece downloaded {piece}");
+                    tx.send(ThreadUpdate::Completed(piece as u32))?;
                 }
                 if download.is_downloaded() {
                     tx.send(ThreadUpdate::FileComplete)?;

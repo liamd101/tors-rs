@@ -19,6 +19,8 @@ use super::{
     pieces::PieceTracker,
 };
 
+use crate::parsing::TorrentType;
+
 pub async fn handle_peer(
     parent_tx: broadcast::Sender<ThreadUpdate>,
     mut parent_rx: broadcast::Receiver<ThreadUpdate>,
@@ -227,7 +229,9 @@ async fn read_message(
     }
 
     let message_id = stream.read_u8().await?;
-    let message_id = MessageId::try_from(message_id)?;
+    let message_id = MessageId::try_from(message_id).with_context(|| {
+        format!("message with length {length} and MessageID {message_id} received")
+    })?;
 
     Ok(Some(Message {
         length,
@@ -249,29 +253,35 @@ async fn process_message(
 
     match message_id {
         MessageId::Piece => {
+            let output_dir = match metadata.info.torr_type {
+                TorrentType::MultiFile { .. } => metadata.info.name.clone(),
+                TorrentType::SingleFile { .. } => "out".to_string(),
+            };
+
             let piece_index: u32 = stream.read_u32().await.context("reading piece index")?;
             let begin: u32 = stream.read_u32().await.context("reading block offset")?;
             let data_len: u32 = message.length - 9;
-            info!("receiving piece={piece_index} offset={begin}");
 
             for (file, file_offset, bytes_to_read) in
                 metadata.from_piece_block(piece_index as u64, begin as u64, data_len as u64)?
             {
-                let filename = file.path.join(std::path::MAIN_SEPARATOR_STR);
+                let mut filename = vec![output_dir.clone()];
+                filename.extend_from_slice(&file.path);
+                let filename = filename.join(std::path::MAIN_SEPARATOR_STR);
                 let mut out_file = tokio::fs::File::options()
                     .create(true)
                     .write(true)
                     .truncate(false)
                     .open(&filename)
                     .await
-                    .with_context(|| "opening output file")?;
+                    .with_context(|| format!("opening output file {filename}"))?;
                 if out_file.metadata().await?.len() == 0 {
                     out_file.set_len(file.length).await?;
                 }
                 out_file
                     .seek(SeekFrom::Start(file_offset))
                     .await
-                    .with_context(|| "seeking to {file_offset}")?;
+                    .with_context(|| format!("seeking to {file_offset}"))?;
                 let mut piece_data = vec![0u8; bytes_to_read as usize];
                 let bytes_read = stream
                     .read_exact(&mut piece_data)

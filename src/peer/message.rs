@@ -134,7 +134,7 @@ impl TryFrom<u8> for MessageId {
             7 => Ok(MessageId::Piece),
             8 => Ok(MessageId::Cancel),
             9 => Ok(MessageId::Port),
-            _ => Err(anyhow::anyhow!("Invalid MessageId")),
+            _ => Err(anyhow::anyhow!("Invalid MessageId {val}")),
         }
     }
 }

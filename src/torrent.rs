@@ -4,7 +4,7 @@ use crate::{
     download::{Download, monitor_file_progress},
     message::BitField,
     parsing::Metadata,
-    peer::{handshake::Handshake, Peer, handle_peer, handshake::try_handshake},
+    peer::{handle_peer, handshake::Handshake, handshake::try_handshake},
     tracker,
 };
 
@@ -12,6 +12,7 @@ use anyhow::{Context, Result};
 use tokio::{sync::broadcast, task::JoinSet};
 use tracing::{Instrument, debug, error, info, warn};
 
+use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 
 pub struct Client {
@@ -52,8 +53,8 @@ impl Client {
         self.start_download(peers).await
     }
 
-    async fn connect_to_peer(&self, peer: &Peer) -> Result<tokio::net::TcpStream> {
-        let mut stream = tokio::net::TcpStream::connect(peer.socket_addr)
+    async fn connect_to_peer(&self, peer: &SocketAddr) -> Result<tokio::net::TcpStream> {
+        let mut stream = tokio::net::TcpStream::connect(peer)
             .await
             .expect("couldn't connect to peer");
 
@@ -66,7 +67,7 @@ impl Client {
         }
     }
 
-    async fn discover_peers(&self) -> Result<Vec<Peer>> {
+    async fn discover_peers(&self) -> Result<Vec<SocketAddr>> {
         let res = tracker::make_request(&self.metadata, &self.listener)
             .await
             .context("Unable to contact tracker.")?;
@@ -78,7 +79,7 @@ impl Client {
         }
     }
 
-    async fn start_download(self, peers: Vec<Peer>) -> Result<()> {
+    async fn start_download(self, peers: Vec<SocketAddr>) -> Result<()> {
         let my_bitfield = self.download.bitfield();
         let (tx, rx) = broadcast::channel::<ThreadUpdate>(32);
         let mut set = JoinSet::new();
@@ -96,7 +97,7 @@ impl Client {
     async fn spawn_peer_connections(
         &self,
         task_set: &mut JoinSet<()>,
-        peers: Vec<Peer>,
+        peers: Vec<SocketAddr>,
         tx: broadcast::Sender<ThreadUpdate>,
         bitfield: Arc<RwLock<BitField>>,
     ) {
@@ -104,13 +105,13 @@ impl Client {
             match self.connect_to_peer(peer).await {
                 Ok(stream) => self.spawn_peer_handler(
                     task_set,
-                    peer.clone(),
+                    *peer,
                     stream,
                     tx.clone(),
                     bitfield.clone(),
                 ),
                 Err(e) => {
-                    warn!("Failed to connect to peer {}: {}", peer.socket_addr, e);
+                    warn!("Failed to connect to peer {}: {}", peer, e);
                 }
             }
         }
@@ -119,7 +120,7 @@ impl Client {
     fn spawn_peer_handler(
         &self,
         task_set: &mut JoinSet<()>,
-        peer: Peer,
+        peer: SocketAddr,
         stream: tokio::net::TcpStream,
         tx: broadcast::Sender<ThreadUpdate>,
         bitfield: Arc<RwLock<BitField>>,
@@ -128,7 +129,7 @@ impl Client {
         let thread_rx = tx.subscribe();
 
         task_set.spawn(async move {
-            let span = tracing::info_span!("peer", peer_addr = %peer.socket_addr);
+            let span = tracing::info_span!("peer", peer_addr = %peer);
             match handle_peer(tx, thread_rx, stream, metadata, bitfield)
                 .instrument(span)
                 .await

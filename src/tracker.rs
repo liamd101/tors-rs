@@ -1,12 +1,15 @@
 use std::collections::HashMap;
+use std::net::SocketAddr;
 
-use crate::{parsing::Metadata, peer::Peer};
+use crate::parsing::Metadata;
 
-use serde::de::{self, Visitor};
+use serde::de::{self, Error, Visitor};
 use serde::{Deserialize, Deserializer};
 
 use anyhow::{Context, Result};
 use tokio::net::TcpListener;
+
+use tracing::debug;
 
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
@@ -34,10 +37,10 @@ pub enum Response {
         peers: Peers,
 
         /// The number of peers with the entire file, i.e. seeders
-        complete: usize,
+        complete: Option<usize>,
 
         /// The number of non-seeder peers, aka "leechers"
-        incomplete: usize,
+        incomplete: Option<usize>,
     },
     /// Unsuccessful response from the tracker. Contains an error message
     Error {
@@ -48,7 +51,13 @@ pub enum Response {
 }
 
 #[derive(Debug)]
-pub struct Peers(pub Vec<Peer>);
+pub struct Peers(pub Vec<SocketAddr>);
+
+#[derive(Deserialize, Debug)]
+struct PeerDict {
+    ip: String,
+    port: usize,
+}
 
 struct PeersVisitor;
 impl<'de> Visitor<'de> for PeersVisitor {
@@ -67,16 +76,38 @@ impl<'de> Visitor<'de> for PeersVisitor {
                 "byte string length must be multiple of 6".to_string(),
             ));
         }
-        Ok(Peers(
-            value.chunks_exact(6).filter_map(Peer::from_bytes).collect(),
-        ))
+        let peers = value
+            .chunks_exact(6)
+            .filter_map(|b| {
+                if b.len() < 6 {
+                    return None;
+                }
+                let ip_addr = std::net::Ipv4Addr::new(b[0], b[1], b[2], b[3]);
+                let port = u16::from_be_bytes([b[4], b[5]]);
+                Some(std::net::SocketAddr::new(
+                    std::net::IpAddr::V4(ip_addr),
+                    port,
+                ))
+            })
+            .collect();
+        Ok(Peers(peers))
     }
 
-    fn visit_seq<A>(self, mut _seq: A) -> Result<Self::Value, A::Error>
+    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
     where
         A: de::SeqAccess<'de>,
     {
-        todo!();
+        let mut peers = Vec::new();
+        while let Some(peer_dict) = seq.next_element::<PeerDict>()? {
+            let ip_addr = peer_dict
+                .ip
+                .parse::<std::net::Ipv4Addr>()
+                .map_err(|_| A::Error::custom(format!("Invalid IP address: {}", peer_dict.ip)))?;
+            let port: u16 = peer_dict.port.try_into().unwrap();
+            let socket_addr = std::net::SocketAddr::new(std::net::IpAddr::V4(ip_addr), port);
+            peers.push(socket_addr);
+        }
+        Ok(Peers(peers))
     }
 }
 
@@ -147,29 +178,45 @@ pub async fn make_request(metadata: &Metadata, listener: &TcpListener) -> anyhow
     match &metadata.announce_list {
         Some(announce_list) => {
             for announce in announce_list {
-                let announce: reqwest::Url = announce.parse().context("couldn't parse into URL")?;
+                let announce_url: reqwest::Url =
+                    announce.parse().context("couldn't parse into URL")?;
 
-                match announce.scheme() {
-                    "http" | "https" => continue,
-                    _ => {}
+                match announce_url.scheme() {
+                    "http" | "https" => {}
+                    _ => continue,
                 }
                 let announce = format!("{}?{}", announce, http_params);
                 let res = reqwest::get(announce)
                     .await
                     .context("invalid tracker URL")?;
+                debug!("announce list");
                 let body = res.bytes().await.context("error reading body")?;
 
                 return Ok(serde_bencode::from_bytes(&body)?);
             }
         }
         None => {
+            let announce: reqwest::Url = metadata
+                .announce
+                .parse()
+                .context("couldn't parse into URL")?;
+            match announce.scheme() {
+                "http" | "https" => {}
+                _ => anyhow::bail!("Unsupported Tracker scheme"),
+            }
+
+            debug!("announce");
+
             let announce = format!("{}?{}", metadata.announce, http_params);
+            debug!("{announce}");
             let res = reqwest::get(announce)
                 .await
                 .context("invalid tracker URL")?;
-            let body = res.bytes().await.context("error reading body")?;
 
-            return Ok(serde_bencode::from_bytes(&body)?);
+            let body = res.bytes().await.context("error reading body")?;
+            let decoded: Response = serde_bencode::from_bytes(&body)?;
+
+            return Ok(decoded);
         }
     }
 
