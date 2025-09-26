@@ -1,8 +1,9 @@
 use clap::Parser;
 
-use anyhow::{Context, Result};
-use dotenv::dotenv;
+use anyhow::Result;
 use tracing_subscriber::EnvFilter;
+
+use rand::prelude::*;
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -19,6 +20,11 @@ struct Args {
     max_peers: usize,
 }
 
+const CLIENT_NAME: &str = "RS";
+const CLIENT_VERSION_MAJOR: u8 = 0;
+const CLIENT_VERSION_MINOR: u8 = 1;
+const CLIENT_VERSION_PATCH: u8 = 0;
+
 pub struct Config {
     pub file: String,
     pub verbose: bool,
@@ -28,13 +34,17 @@ pub struct Config {
 impl Config {
     pub fn from_args() -> Result<Self> {
         let args = Args::parse();
-        dotenv().ok();
 
-        let peer_id: [u8; 20] = std::env::var("USER_PEER_ID")
-            .context("USER_PEER_ID must be set.")?
-            .as_bytes()
-            .try_into()
-            .context("Invalid peer ID format.")?;
+        let mut peer_id: [u8; 20] = [0u8; 20];
+        peer_id[0] = b'-';
+        peer_id[1] = CLIENT_NAME.bytes().collect::<Vec<u8>>()[0];
+        peer_id[2] = CLIENT_NAME.bytes().collect::<Vec<u8>>()[1];
+        peer_id[3] = CLIENT_VERSION_MAJOR;
+        peer_id[4] = CLIENT_VERSION_MINOR;
+        peer_id[5] = CLIENT_VERSION_PATCH;
+        peer_id[6] = 0;
+        peer_id[7] = b'-';
+        rand::rng().fill_bytes(&mut peer_id[8..]);
 
         Ok(Config {
             file: args.file,

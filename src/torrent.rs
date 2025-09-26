@@ -8,7 +8,7 @@ use crate::{
 };
 
 use anyhow::{Context, Result};
-use bitvec::vec::BitVec;
+use bitvec::prelude::*;
 use tokio::{sync::broadcast, task::JoinSet};
 use tracing::{Instrument, debug, error, info, warn};
 
@@ -68,7 +68,7 @@ impl Client {
     }
 
     async fn discover_peers(&self) -> Result<Vec<SocketAddr>> {
-        let res = tracker::make_request(&self.metadata, &self.listener)
+        let res = tracker::make_request(self.config.peer_id, &self.metadata, &self.listener)
             .await
             .context("Unable to contact tracker.")?;
         match res {
@@ -99,7 +99,7 @@ impl Client {
         task_set: &mut JoinSet<()>,
         peers: Vec<SocketAddr>,
         tx: broadcast::Sender<ThreadUpdate>,
-        bitfield: Arc<RwLock<BitVec<u8>>>,
+        bitfield: Arc<RwLock<BitVec<u8, Msb0>>>,
     ) {
         for peer in peers.iter().take(self.config.max_peers) {
             match self.connect_to_peer(peer).await {

@@ -28,13 +28,13 @@ pub async fn handle_peer(
     mut parent_rx: broadcast::Receiver<ThreadUpdate>,
     stream: TcpStream,
     metadata: Metadata,
-    my_bitfield: Arc<RwLock<BitVec<u8>>>,
+    my_bitfield: Arc<RwLock<BitVec<u8, Msb0>>>,
 ) -> Result<(), std::io::Error> {
     debug!("handling peer connection");
 
     let num_pieces: u64 = metadata.num_pieces() as u64;
 
-    let peer_bitfield = Arc::new(RwLock::new(BitVec::<u8, Lsb0>::repeat(
+    let peer_bitfield = Arc::new(RwLock::new(BitVec::<u8, Msb0>::repeat(
         false,
         num_pieces as usize,
     )));
@@ -186,7 +186,7 @@ async fn read_peer(
     mut rx: broadcast::Receiver<ThreadUpdate>,
     mut stream: tokio::io::ReadHalf<TcpStream>,
     metadata: Metadata,
-    peer_bitfield: Arc<RwLock<BitVec<u8>>>,
+    peer_bitfield: Arc<RwLock<BitVec<u8, Msb0>>>,
     choked: Arc<RwLock<bool>>,
 ) -> anyhow::Result<ChildUpdates, anyhow::Error> {
     loop {
@@ -249,7 +249,7 @@ async fn process_message(
     tx: &broadcast::Sender<ThreadUpdate>,
     stream: &mut tokio::io::ReadHalf<TcpStream>,
     metadata: Metadata,
-    peer_bitfield: &Arc<RwLock<BitVec<u8>>>,
+    peer_bitfield: &Arc<RwLock<BitVec<u8, Msb0>>>,
     choked: &Arc<RwLock<bool>>,
 ) -> anyhow::Result<()> {
     let Some(message_id) = message.message_id else {
@@ -314,12 +314,12 @@ async fn process_message(
             let mut payload = vec![0u8; message.length as usize - 1];
             stream.read_exact(&mut payload).await?;
             let received_bitfield =
-                &BitVec::<u8, Lsb0>::from_slice(&payload)[..metadata.num_pieces()];
+                &BitVec::<u8, Msb0>::from_slice(&payload)[..metadata.num_pieces()];
             let mut peer_bitfield = peer_bitfield.write().unwrap();
             for set_bit in received_bitfield.iter_ones() {
                 peer_bitfield.set(set_bit, true);
             }
-            debug!("bitfield={peer_bitfield:?}");
+            debug!("bitfield={peer_bitfield}");
         }
 
         MessageId::Interested => {
@@ -353,8 +353,8 @@ async fn write_peer(
     mut rx: broadcast::Receiver<ThreadUpdate>,
     mut stream: tokio::io::WriteHalf<TcpStream>,
     metadata: Metadata,
-    my_bitfield: Arc<RwLock<BitVec<u8>>>,
-    peer_bitfield: Arc<RwLock<BitVec<u8>>>,
+    my_bitfield: Arc<RwLock<BitVec<u8, Msb0>>>,
+    peer_bitfield: Arc<RwLock<BitVec<u8, Msb0>>>,
     choked: Arc<RwLock<bool>>,
 ) -> Result<ChildUpdates, Error> {
     let mut am_interested = false;
@@ -425,7 +425,7 @@ async fn write_peer(
         }
 
         let choked = *choked.read().unwrap();
-        /* If the peer has something that we want, have not sent
+        /* If the peer has something that we ?want, have not sent
          * the peer an Interested message, send an interested message. */
         let interested =
             (!my_bitfield.read().unwrap().clone() & peer_bitfield.read().unwrap().clone()).any();

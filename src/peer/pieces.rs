@@ -34,7 +34,7 @@ impl PieceTracker {
 
     /// Updates `self` so that all blocks and pieces that are set true in the bitfield are set to `Completed`
     /// in `self.blocks`
-    pub fn update(&mut self, bitfield: &BitVec<u8>) {
+    pub fn update(&mut self, bitfield: &BitVec<u8, Msb0>) {
         for piece_idx in bitfield.iter_ones() {
             let piece = self.blocks.get_mut(piece_idx).unwrap();
             *piece = vec![BlockState::Completed; piece.len()];

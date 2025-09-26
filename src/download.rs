@@ -33,23 +33,25 @@ pub struct Download {
     piece_hashes: Hashes,
     /// A BitField of the currently downloaded pieces. Read from left-to-right with a 1 set if the
     /// piece is downloaded and verified. 0 otherwise
-    bitvec: Arc<RwLock<BitVec<u8, Lsb0>>>,
+    bitvec: Arc<RwLock<BitVec<u8, Msb0>>>,
 }
 
 impl Download {
     // TODO: update this error type to something more robust
     pub async fn new(metadata: &Metadata) -> Result<Self> {
         let num_pieces = metadata.num_pieces();
-        let bitvec = Arc::new(RwLock::new(BitVec::<u8, Lsb0>::repeat(false, num_pieces)));
+        let bitvec = Arc::new(RwLock::new(BitVec::<u8, Msb0>::repeat(false, num_pieces)));
 
         let files = match &metadata.info.torr_type {
             &TorrentType::SingleFile { length, .. } => {
-                let path: Vec<String> = metadata
-                    .info
-                    .name
-                    .split(std::path::MAIN_SEPARATOR)
-                    .map(|s| s.to_string())
-                    .collect();
+                let mut path: Vec<String> = vec![String::from("out")];
+                path.extend(
+                    metadata
+                        .info
+                        .name
+                        .split(std::path::MAIN_SEPARATOR)
+                        .map(|s| s.to_string()),
+                );
                 vec![File { length, path }]
             }
             TorrentType::MultiFile { files } => files
@@ -88,7 +90,7 @@ impl Download {
             if let Some(parent) = path.parent() {
                 tokio::fs::create_dir_all(parent)
                     .await
-                    .context("Failed to create directories for {parent:?}")?;
+                    .with_context(|| format!("Failed to create directories for {parent:?}"))?;
             }
             let file_handle = tokio::fs::File::options()
                 .create(true)
@@ -193,7 +195,7 @@ impl Download {
         }
     }
 
-    pub fn bitfield(&self) -> Arc<RwLock<BitVec<u8>>> {
+    pub fn bitfield(&self) -> Arc<RwLock<BitVec<u8, Msb0>>> {
         self.bitvec.clone()
     }
 }
