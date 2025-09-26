@@ -1,7 +1,7 @@
+use bitvec::prelude::*;
 use rand::seq::IndexedRandom;
 
 use super::{BLOCK_SIZE, BlockState};
-use crate::message::BitField;
 
 pub(crate) struct PieceTracker {
     num_requested: usize,
@@ -34,8 +34,8 @@ impl PieceTracker {
 
     /// Updates `self` so that all blocks and pieces that are set true in the bitfield are set to `Completed`
     /// in `self.blocks`
-    pub fn update(&mut self, bitfield: &BitField) {
-        for piece_idx in bitfield.set_bits() {
+    pub fn update(&mut self, bitfield: &BitVec<u8>) {
+        for piece_idx in bitfield.iter_ones() {
             let piece = self.blocks.get_mut(piece_idx).unwrap();
             *piece = vec![BlockState::Completed; piece.len()];
         }

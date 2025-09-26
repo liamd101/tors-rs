@@ -1,6 +1,5 @@
 use crate::{
     ThreadUpdate,
-    message::BitField,
     parsing::Hashes,
     parsing::Metadata,
     parsing::{File, TorrentType},
@@ -15,6 +14,8 @@ use bytes::{Bytes, BytesMut};
 use sha1::{Digest, Sha1};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tracing::{debug, info, instrument, warn};
+
+use bitvec::prelude::*;
 
 /// A data structure representing information for downloading a file from a `.torrent` file.
 #[derive(Debug, Clone)]
@@ -32,14 +33,14 @@ pub struct Download {
     piece_hashes: Hashes,
     /// A BitField of the currently downloaded pieces. Read from left-to-right with a 1 set if the
     /// piece is downloaded and verified. 0 otherwise
-    bitfield: Arc<RwLock<BitField>>,
+    bitvec: Arc<RwLock<BitVec<u8, Lsb0>>>,
 }
 
 impl Download {
     // TODO: update this error type to something more robust
     pub async fn new(metadata: &Metadata) -> Result<Self> {
         let num_pieces = metadata.num_pieces();
-        let bitfield = Arc::new(RwLock::new(BitField::with_settable(num_pieces as u64)));
+        let bitvec = Arc::new(RwLock::new(BitVec::<u8, Lsb0>::repeat(false, num_pieces)));
 
         let files = match &metadata.info.torr_type {
             &TorrentType::SingleFile { length, .. } => {
@@ -70,8 +71,8 @@ impl Download {
             length: metadata.info.torr_type.len(),
             num_pieces,
             piece_hashes: metadata.info.pieces.clone(),
-            bitfield,
             files,
+            bitvec,
         };
 
         debug!("initializing files");
@@ -106,7 +107,7 @@ impl Download {
     }
 
     pub fn is_downloaded(&self) -> bool {
-        self.bitfield.read().unwrap().set_bits().len() == self.num_pieces
+        self.bitvec.read().unwrap().count_ones() == self.num_pieces
     }
 
     /// Iterates through all pieces of the file, computes their SHA1 hash, and then sets their
@@ -136,11 +137,10 @@ impl Download {
         let finished_download = piece_hash == hash;
 
         let prev = self
-            .bitfield
+            .bitvec
             .write()
             .unwrap()
-            .set(piece, finished_download)
-            .expect("index out of bounds");
+            .replace(piece, finished_download);
 
         // return whether the piece is updated or not
         Ok(finished_download && !prev)
@@ -193,8 +193,8 @@ impl Download {
         }
     }
 
-    pub fn bitfield(&self) -> Arc<RwLock<BitField>> {
-        self.bitfield.clone()
+    pub fn bitfield(&self) -> Arc<RwLock<BitVec<u8>>> {
+        self.bitvec.clone()
     }
 }
 

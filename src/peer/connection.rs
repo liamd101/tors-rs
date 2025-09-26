@@ -11,7 +11,9 @@ use tokio::task::JoinSet;
 
 use tracing::{Instrument, debug, error, info, warn};
 
-use crate::{ThreadUpdate, message::BitField, parsing::Metadata};
+use bitvec::prelude::*;
+
+use crate::{ThreadUpdate, parsing::Metadata};
 
 use super::{
     BLOCK_SIZE,
@@ -26,13 +28,16 @@ pub async fn handle_peer(
     mut parent_rx: broadcast::Receiver<ThreadUpdate>,
     stream: TcpStream,
     metadata: Metadata,
-    my_bitfield: Arc<RwLock<BitField>>,
+    my_bitfield: Arc<RwLock<BitVec<u8>>>,
 ) -> Result<(), std::io::Error> {
     debug!("handling peer connection");
 
     let num_pieces: u64 = metadata.num_pieces() as u64;
 
-    let peer_bitfield = Arc::new(RwLock::new(BitField::with_settable(num_pieces)));
+    let peer_bitfield = Arc::new(RwLock::new(BitVec::<u8, Lsb0>::repeat(
+        false,
+        num_pieces as usize,
+    )));
     let choked = Arc::new(RwLock::new(true));
 
     let (read_stream, write_stream) = tokio::io::split(stream);
@@ -181,7 +186,7 @@ async fn read_peer(
     mut rx: broadcast::Receiver<ThreadUpdate>,
     mut stream: tokio::io::ReadHalf<TcpStream>,
     metadata: Metadata,
-    peer_bitfield: Arc<RwLock<BitField>>,
+    peer_bitfield: Arc<RwLock<BitVec<u8>>>,
     choked: Arc<RwLock<bool>>,
 ) -> anyhow::Result<ChildUpdates, anyhow::Error> {
     loop {
@@ -244,7 +249,7 @@ async fn process_message(
     tx: &broadcast::Sender<ThreadUpdate>,
     stream: &mut tokio::io::ReadHalf<TcpStream>,
     metadata: Metadata,
-    peer_bitfield: &Arc<RwLock<BitField>>,
+    peer_bitfield: &Arc<RwLock<BitVec<u8>>>,
     choked: &Arc<RwLock<bool>>,
 ) -> anyhow::Result<()> {
     let Some(message_id) = message.message_id else {
@@ -308,13 +313,12 @@ async fn process_message(
         MessageId::BitField => {
             let mut payload = vec![0u8; message.length as usize - 1];
             stream.read_exact(&mut payload).await?;
-            let sent_bitfield = BitField::new(payload, metadata.num_pieces() as u64)
-                .expect("peer has an impossible bitfield");
-            peer_bitfield
-                .write()
-                .unwrap()
-                .update(&sent_bitfield)
-                .context("updating peer bitfield from sent")?;
+            let received_bitfield =
+                &BitVec::<u8, Lsb0>::from_slice(&payload)[..metadata.num_pieces()];
+            let mut peer_bitfield = peer_bitfield.write().unwrap();
+            for set_bit in received_bitfield.iter_ones() {
+                peer_bitfield.set(set_bit, true);
+            }
             debug!("bitfield={peer_bitfield:?}");
         }
 
@@ -325,11 +329,7 @@ async fn process_message(
 
         MessageId::Have => {
             let index: u32 = stream.read_u32().await?;
-            peer_bitfield
-                .write()
-                .unwrap()
-                .set(index as usize, true)
-                .expect("invalid index");
+            peer_bitfield.write().unwrap().set(index as usize, true);
         }
 
         MessageId::UnChoke => {
@@ -353,8 +353,8 @@ async fn write_peer(
     mut rx: broadcast::Receiver<ThreadUpdate>,
     mut stream: tokio::io::WriteHalf<TcpStream>,
     metadata: Metadata,
-    my_bitfield: Arc<RwLock<BitField>>,
-    peer_bitfield: Arc<RwLock<BitField>>,
+    my_bitfield: Arc<RwLock<BitVec<u8>>>,
+    peer_bitfield: Arc<RwLock<BitVec<u8>>>,
     choked: Arc<RwLock<bool>>,
 ) -> Result<ChildUpdates, Error> {
     let mut am_interested = false;
@@ -427,13 +427,10 @@ async fn write_peer(
         let choked = *choked.read().unwrap();
         /* If the peer has something that we want, have not sent
          * the peer an Interested message, send an interested message. */
-        if my_bitfield
-            .read()
-            .unwrap()
-            .has_other(&peer_bitfield.read().unwrap())
-            .expect("one of us has incorrect bitfield")
-            && !am_interested
-        {
+        let interested =
+            (!my_bitfield.read().unwrap().clone() & peer_bitfield.read().unwrap().clone()).any();
+
+        if interested && !am_interested {
             let message = Message::interested();
             debug!("sending message: {message:?}");
 
@@ -445,13 +442,7 @@ async fn write_peer(
             am_interested = true;
         }
 
-        if !my_bitfield
-            .read()
-            .unwrap()
-            .has_other(&peer_bitfield.read().unwrap())
-            .expect("one of us has incorrect bitfield")
-            && am_interested
-        {
+        if !interested && am_interested {
             let message = Message::not_interested();
             debug!("sending message: {message:?}");
 
@@ -463,7 +454,7 @@ async fn write_peer(
             am_interested = false;
         }
 
-        let peer_has = peer_bitfield.read().unwrap().set_bits();
+        let peer_has = peer_bitfield.read().unwrap().iter_ones().collect();
         if !choked && let Some((piece, block_num)) = requested.request(peer_has) {
             let message = Message::request();
             debug!("sending message: {message:?}");

@@ -2,13 +2,13 @@ use crate::{
     ThreadUpdate,
     config::Config,
     download::{Download, monitor_file_progress},
-    message::BitField,
     parsing::Metadata,
     peer::{handle_peer, handshake::Handshake, handshake::try_handshake},
     tracker,
 };
 
 use anyhow::{Context, Result};
+use bitvec::vec::BitVec;
 use tokio::{sync::broadcast, task::JoinSet};
 use tracing::{Instrument, debug, error, info, warn};
 
@@ -99,41 +99,33 @@ impl Client {
         task_set: &mut JoinSet<()>,
         peers: Vec<SocketAddr>,
         tx: broadcast::Sender<ThreadUpdate>,
-        bitfield: Arc<RwLock<BitField>>,
+        bitfield: Arc<RwLock<BitVec<u8>>>,
     ) {
         for peer in peers.iter().take(self.config.max_peers) {
             match self.connect_to_peer(peer).await {
                 Ok(stream) => {
-                    self.spawn_peer_handler(task_set, *peer, stream, tx.clone(), bitfield.clone())
+                    let metadata = self.metadata.clone();
+                    let tx = tx.clone();
+                    let thread_rx = tx.subscribe();
+                    let peer = *peer;
+                    let bitfield = bitfield.clone();
+
+                    task_set.spawn(async move {
+                        let span = tracing::info_span!("peer", peer_addr = %peer);
+                        match handle_peer(tx, thread_rx, stream, metadata, bitfield)
+                            .instrument(span)
+                            .await
+                        {
+                            Ok(()) => {}
+                            Err(e) => error!("{e}"),
+                        }
+                    });
                 }
                 Err(e) => {
                     warn!("Failed to connect to peer {}: {}", peer, e);
                 }
             }
         }
-    }
-
-    fn spawn_peer_handler(
-        &self,
-        task_set: &mut JoinSet<()>,
-        peer: SocketAddr,
-        stream: tokio::net::TcpStream,
-        tx: broadcast::Sender<ThreadUpdate>,
-        bitfield: Arc<RwLock<BitField>>,
-    ) {
-        let metadata = self.metadata.clone();
-        let thread_rx = tx.subscribe();
-
-        task_set.spawn(async move {
-            let span = tracing::info_span!("peer", peer_addr = %peer);
-            match handle_peer(tx, thread_rx, stream, metadata, bitfield)
-                .instrument(span)
-                .await
-            {
-                Ok(()) => {}
-                Err(e) => error!("{e}"),
-            }
-        });
     }
 
     fn spawn_file_monitor(

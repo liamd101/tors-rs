@@ -86,5 +86,3 @@ pub async fn try_handshake(
     let peer_response = Handshake::from_bytes(&parts).expect("invalid peer response");
     Ok(peer_response.info_hash == handshake.info_hash)
 }
-
-

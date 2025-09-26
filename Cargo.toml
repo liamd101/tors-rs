@@ -15,6 +15,7 @@ panic = "abort"
 
 [dependencies]
 anyhow = "1.0.99"
+bitvec = "1.0.1"
 bytes = "1"
 clap = { version = "4.5.45", features = ["derive"] }
 dotenv = "0.15.0"
