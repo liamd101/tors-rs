@@ -103,13 +103,9 @@ impl Client {
     ) {
         for peer in peers.iter().take(self.config.max_peers) {
             match self.connect_to_peer(peer).await {
-                Ok(stream) => self.spawn_peer_handler(
-                    task_set,
-                    *peer,
-                    stream,
-                    tx.clone(),
-                    bitfield.clone(),
-                ),
+                Ok(stream) => {
+                    self.spawn_peer_handler(task_set, *peer, stream, tx.clone(), bitfield.clone())
+                }
                 Err(e) => {
                     warn!("Failed to connect to peer {}: {}", peer, e);
                 }

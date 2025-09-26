@@ -71,7 +71,7 @@ impl<'de> Visitor<'de> for PeersVisitor {
     where
         E: de::Error,
     {
-        if value.len() % 6 != 0 {
+        if !value.len().is_multiple_of(6) {
             return Err(E::custom(
                 "byte string length must be multiple of 6".to_string(),
             ));

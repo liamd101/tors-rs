@@ -251,6 +251,8 @@ async fn process_message(
         return Ok(());
     };
 
+    debug!("Received message: {message:?}");
+
     match message_id {
         MessageId::Piece => {
             let output_dir = match metadata.info.torr_type {
@@ -261,8 +263,18 @@ async fn process_message(
             let piece_index: u32 = stream.read_u32().await.context("reading piece index")?;
             let begin: u32 = stream.read_u32().await.context("reading block offset")?;
             let data_len: u32 = message.length - 9;
+            let mut piece_data = vec![0u8; data_len as usize];
+            let bytes_read = stream
+                .read_exact(&mut piece_data)
+                .await
+                .context("reading piece data")?;
+            if bytes_read != data_len as usize {
+                error!("read {bytes_read} bytes instead of {data_len} bytes. closing connection.");
+                return Ok(()); // TODO: return error here
+            }
 
-            for (file, file_offset, bytes_to_read) in
+            let mut piece_position = 0;
+            for (file, file_offset, bytes_to_write) in
                 metadata.from_piece_block(piece_index as u64, begin as u64, data_len as u64)?
             {
                 let mut filename = vec![output_dir.clone()];
@@ -282,20 +294,14 @@ async fn process_message(
                     .seek(SeekFrom::Start(file_offset))
                     .await
                     .with_context(|| format!("seeking to {file_offset}"))?;
-                let mut piece_data = vec![0u8; bytes_to_read as usize];
-                let bytes_read = stream
-                    .read_exact(&mut piece_data)
-                    .await
-                    .context("reading piece data")?;
                 out_file
-                    .write_all(&piece_data)
+                    .write_all(&piece_data[piece_position..][..bytes_to_write as usize])
                     .await
                     .context("writing piece data to file")?;
-                debug!(
-                    "filename={}: wrote {bytes_read} bytes to {}",
-                    filename, file_offset
-                );
+                debug!(filename=?filename,"wrote {bytes_to_write} bytes to {file_offset}");
+                piece_position += bytes_to_write as usize;
             }
+            debug!("Downloaded part of piece={piece_index}");
             tx.send(ThreadUpdate::Downloaded(piece_index, begin / BLOCK_SIZE))?;
         }
 
@@ -327,10 +333,14 @@ async fn process_message(
         }
 
         MessageId::UnChoke => {
+            info!("Unchoked by peer");
             *choked.write().unwrap() = false;
         }
 
-        MessageId::Choke => *choked.write().unwrap() = true,
+        MessageId::Choke => {
+            info!("Choked by peer");
+            *choked.write().unwrap() = true;
+        }
 
         _ => todo!(),
     }
@@ -372,7 +382,7 @@ async fn write_peer(
             Ok(ThreadUpdate::Completed(piece)) => {
                 requested.mark_piece_as_downloaded(piece as usize);
                 let message = Message::have();
-                info!("sending message: {message:?}");
+                debug!("sending message: {message:?}");
 
                 stream
                     .write_all(&message.as_bytes())
@@ -470,7 +480,7 @@ async fn write_peer(
             );
 
             let block_begin = block_num * BLOCK_SIZE;
-            info!("requesting piece={piece} block_begin={block_begin}");
+            debug!("requesting piece={piece} block_begin={block_begin}");
             stream
                 .write_u32(piece)
                 .await

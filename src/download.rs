@@ -209,15 +209,14 @@ pub async fn monitor_file_progress(
             Ok(ThreadUpdate::Downloaded(piece, _)) => {
                 let new_download = download.update_piece(piece as usize).await?;
                 if new_download {
-                    debug!("piece downloaded {piece}");
-                    tx.send(ThreadUpdate::Completed(piece as u32))?;
+                    tx.send(ThreadUpdate::Completed(piece))?;
                 }
                 if download.is_downloaded() {
                     tx.send(ThreadUpdate::FileComplete)?;
                 }
             }
-            Ok(ThreadUpdate::Completed(_)) => {
-                continue;
+            Ok(ThreadUpdate::Completed(piece)) => {
+                info!("Downloaded piece {piece}");
             }
             Ok(ThreadUpdate::FileComplete) => {
                 info!("file complete received");

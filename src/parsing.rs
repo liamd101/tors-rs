@@ -3,6 +3,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha1::{Digest, Sha1};
 use std::fmt;
 
+use tracing::debug;
+
 #[allow(dead_code)]
 #[derive(Debug, Deserialize, Clone)]
 pub struct Metadata {
@@ -67,7 +69,7 @@ impl Metadata {
         let p_length = self.info.piece_length;
         let piece_start = piece_idx * p_length;
         let block_start = piece_start + begin;
-        let block_end = piece_start + data_len;
+        let block_end = block_start + data_len;
 
         if piece_start >= self.info.torr_type.len() {
             anyhow::bail!("Invalid piece index.");
@@ -103,6 +105,8 @@ impl Metadata {
                         let seek_offset = block_start.saturating_sub(file_start);
                         let read_start_in_torrent = std::cmp::max(block_start, file_start);
                         let read_end_in_torrent = std::cmp::min(block_end, file_end);
+                        debug!("read_end_in_torrent={read_end_in_torrent}");
+                        debug!("read_start_in_torrent={read_start_in_torrent}");
                         let bytes_to_read = read_end_in_torrent - read_start_in_torrent;
 
                         out.push((file.clone(), seek_offset, bytes_to_read));
@@ -164,7 +168,7 @@ impl<'de> Visitor<'de> for HashesVisitor {
     where
         E: de::Error,
     {
-        if value.len() % 20 != 0 {
+        if !value.len().is_multiple_of(20) {
             return Err(E::custom("invalid length of hash string".to_string()));
         }
         Ok(Hashes(
