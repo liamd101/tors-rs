@@ -56,7 +56,7 @@ impl Client {
     async fn connect_to_peer(&self, peer: &SocketAddr) -> Result<tokio::net::TcpStream> {
         let mut stream = tokio::net::TcpStream::connect(peer)
             .await
-            .expect("couldn't connect to peer");
+            .context("couldn't connect to peer")?;
 
         let handshake = Handshake::v1(self.metadata.info_hash(), self.config.peer_id);
 

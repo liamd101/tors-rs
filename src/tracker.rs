@@ -138,7 +138,7 @@ impl std::fmt::Display for TrackerEvent {
 
 fn format_tracker_params(metadata: &Metadata, listener: &TcpListener) -> anyhow::Result<String> {
     let peer_id: [u8; 20] = std::env::var("USER_PEER_ID")
-        .expect("USER_PEER_ID must be set.")
+        .context("USER_PEER_ID must be set.")?
         .as_bytes()
         .try_into()
         .context("invalid USER_PEER_ID.")?;
