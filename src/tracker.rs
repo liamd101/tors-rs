@@ -136,7 +136,11 @@ impl std::fmt::Display for TrackerEvent {
     }
 }
 
-fn format_tracker_params(peer_id: [u8; 20], metadata: &Metadata, listener: &TcpListener) -> anyhow::Result<String> {
+fn format_tracker_params(
+    peer_id: [u8; 20],
+    metadata: &Metadata,
+    listener: &TcpListener,
+) -> anyhow::Result<String> {
     let port = listener.local_addr().context("getting addr")?.port();
 
     let mut params: HashMap<String, String> = HashMap::new();
@@ -167,7 +171,11 @@ fn format_tracker_params(peer_id: [u8; 20], metadata: &Metadata, listener: &TcpL
     Ok(params)
 }
 
-pub async fn make_request(peer_id: [u8; 20], metadata: &Metadata, listener: &TcpListener) -> anyhow::Result<Response> {
+pub async fn make_request(
+    peer_id: [u8; 20],
+    metadata: &Metadata,
+    listener: &TcpListener,
+) -> anyhow::Result<Response> {
     let http_params = format_tracker_params(peer_id, metadata, listener)?;
 
     match &metadata.announce_list {
