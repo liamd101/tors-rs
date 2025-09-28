@@ -8,7 +8,8 @@ use crate::{
 };
 
 use std::net::SocketAddr;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
 use anyhow::{Context, Result};
 use bitvec::prelude::*;
@@ -42,7 +43,7 @@ impl Client {
     }
 
     pub async fn run(self) -> Result<()> {
-        if self.download.is_downloaded() {
+        if self.download.is_downloaded().await {
             info!("file is downloaded already!!");
             return Ok(());
         }
@@ -50,7 +51,18 @@ impl Client {
         let peers = self.discover_peers().await?;
         debug!("tracker supplied {} peers", peers.len());
 
-        self.start_download(peers).await
+        let my_bitfield = self.download.bitfield();
+        let (tx, rx) = broadcast::channel::<ThreadUpdate>(32);
+        let mut set = JoinSet::new();
+
+        self.spawn_file_monitor(&mut set, self.download.clone(), tx.clone(), rx);
+
+        self.spawn_peer_connections(&mut set, peers, tx, my_bitfield)
+            .await;
+
+        while set.join_next().await.is_some() {}
+
+        Ok(())
     }
 
     async fn connect_to_peer(&self, peer: &SocketAddr) -> Result<tokio::net::TcpStream> {
@@ -77,21 +89,6 @@ impl Client {
                 anyhow::bail!("Making request to tracker failed: {failure_reason}")
             }
         }
-    }
-
-    async fn start_download(self, peers: Vec<SocketAddr>) -> Result<()> {
-        let my_bitfield = self.download.bitfield();
-        let (tx, rx) = broadcast::channel::<ThreadUpdate>(32);
-        let mut set = JoinSet::new();
-
-        self.spawn_file_monitor(&mut set, self.download.clone(), tx.clone(), rx);
-
-        self.spawn_peer_connections(&mut set, peers, tx, my_bitfield)
-            .await;
-
-        while set.join_next().await.is_some() {}
-
-        Ok(())
     }
 
     async fn spawn_peer_connections(

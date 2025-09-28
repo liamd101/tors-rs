@@ -66,8 +66,7 @@ pub enum MessageId {
     UnChoke = 1,
     /// Indicates that a peer is interested in something that the client has (and vice versa)
     Interested = 2,
-    /// Indicates that a peer is not interested in aynthing that the client has to offer (and vice
-    /// versa)
+    /// Indicates that a peer is not interested in what the client has to offer (and vice versa)
     NotInterested = 3,
     /// Indicates that a peer/client has the piece indicated in the message payload
     ///
@@ -108,10 +107,7 @@ pub enum MessageId {
     ///   begin  : u32 integer specifying the zero-based byte offset within the piece
     ///   length : u32 integer specifying the requested length
     ///
-    /// For more information about Request messages, see here:
-    /// https://wiki.theory.org/BitTorrentSpecification#request:_.3Clen.3D0013.3E.3Cid.3D6.3E.3Cindex.3E.3Cbegin.3E.3Clength.3E
-    ///
-    /// It is typically used during "End Game". TODO
+    /// It is typically used during "End Game".
     Cancel = 8,
     /// Indicates the port that this peer's DHT node is listening on.
     /// Typically sent by newer versions of the Mainline that implements a DHT tracker.

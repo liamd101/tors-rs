@@ -7,7 +7,8 @@ use crate::{
 
 use std::io::SeekFrom;
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
 use anyhow::{Context, Result};
 use bitvec::prelude::*;
@@ -107,8 +108,8 @@ impl Download {
         Ok(())
     }
 
-    pub fn is_downloaded(&self) -> bool {
-        self.bitvec.read().unwrap().count_ones() == self.num_pieces
+    pub async fn is_downloaded(&self) -> bool {
+        self.bitvec.read().await.count_ones() == self.num_pieces
     }
 
     /// Iterates through all pieces of the file, computes their SHA1 hash, and then sets their
@@ -137,11 +138,7 @@ impl Download {
 
         let finished_download = piece_hash == hash;
 
-        let prev = self
-            .bitvec
-            .write()
-            .unwrap()
-            .replace(piece, finished_download);
+        let prev = self.bitvec.write().await.replace(piece, finished_download);
 
         // return whether the piece is updated or not
         Ok(finished_download && !prev)
@@ -212,7 +209,7 @@ pub async fn monitor_file_progress(
                 if new_download {
                     tx.send(ThreadUpdate::Completed(piece))?;
                 }
-                if download.is_downloaded() {
+                if download.is_downloaded().await {
                     tx.send(ThreadUpdate::FileComplete)?;
                 }
             }
@@ -220,7 +217,7 @@ pub async fn monitor_file_progress(
                 debug!("Downloaded piece {piece}");
                 info!(
                     "Downloaded {} out of {} pieces",
-                    download.bitvec.read().unwrap().count_ones(),
+                    download.bitvec.read().await.count_ones(),
                     download.num_pieces
                 );
             }

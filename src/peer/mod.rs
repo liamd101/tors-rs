@@ -2,6 +2,7 @@ mod connection;
 pub mod handshake;
 mod message;
 mod pieces;
+mod state;
 
 const BLOCK_SIZE: u32 = 1 << 14;
 
@@ -13,17 +14,18 @@ enum BlockState {
     Completed,
 }
 
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use bitvec::prelude::*;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::select;
-use tokio::sync::broadcast;
+use tokio::sync::{RwLock, broadcast};
 use tokio::task::JoinSet;
 use tracing::{Instrument, debug, error, warn};
 
 use crate::{ThreadUpdate, parsing::Metadata};
+use state::PeerState;
 
 enum ChildUpdates {
     Read(tokio::io::ReadHalf<TcpStream>),
@@ -40,36 +42,20 @@ pub async fn handle_peer(
 ) -> Result<(), std::io::Error> {
     debug!("handling peer connection");
 
-    let num_pieces: u64 = metadata.num_pieces() as u64;
-
-    let peer_bitfield = Arc::new(RwLock::new(BitVec::<u8, Msb0>::repeat(
-        false,
-        num_pieces as usize,
-    )));
-    let choked = Arc::new(RwLock::new(true));
-
     let (read_stream, write_stream) = tokio::io::split(stream);
-
     let mut set = JoinSet::new();
     let (child_tx, mut child_rx) = broadcast::channel::<ThreadUpdate>(32);
+
+    let peer_state = PeerState::new(metadata, my_bitfield);
 
     let current_span = tracing::Span::current();
     let read_tx = child_tx.clone();
     let read_rx = child_tx.subscribe();
-    let read_metadata = metadata.clone();
-    let read_choked = choked.clone();
-    let read_peer_bitfield = peer_bitfield.clone();
+    let read_state = peer_state.clone();
     set.spawn(async move {
-        match connection::read_peer(
-            read_tx,
-            read_rx,
-            read_stream,
-            read_metadata,
-            read_peer_bitfield,
-            read_choked,
-        )
-        .instrument(current_span)
-        .await
+        match connection::read_peer(read_tx, read_rx, read_stream, read_state)
+            .instrument(current_span)
+            .await
         {
             Ok(stream) => Ok(stream),
             Err(e) => {
@@ -82,22 +68,11 @@ pub async fn handle_peer(
     let current_span = tracing::Span::current();
     let write_tx = child_tx.clone();
     let write_rx = child_tx.subscribe();
-    let write_metadata = metadata.clone();
-    let write_bitfield = my_bitfield.clone();
-    let write_choked = choked.clone();
-    let write_peer_bitfield = peer_bitfield.clone();
+    let write_state = peer_state.clone();
     set.spawn(async move {
-        match connection::write_peer(
-            write_tx,
-            write_rx,
-            write_stream,
-            write_metadata,
-            write_bitfield,
-            write_peer_bitfield,
-            write_choked,
-        )
-        .instrument(current_span)
-        .await
+        match connection::write_peer(write_tx, write_rx, write_stream, write_state)
+            .instrument(current_span)
+            .await
         {
             Ok(stream) => Ok(stream),
             Err(e) => {
@@ -107,6 +82,7 @@ pub async fn handle_peer(
         }
     });
 
+    // Filter some messages to/from parent threads to children
     set.spawn(
         async move {
             loop {
