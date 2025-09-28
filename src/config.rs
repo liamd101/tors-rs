@@ -1,9 +1,7 @@
-use clap::Parser;
-
 use anyhow::Result;
-use tracing_subscriber::EnvFilter;
-
+use clap::Parser;
 use rand::prelude::*;
+use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
 struct Args {

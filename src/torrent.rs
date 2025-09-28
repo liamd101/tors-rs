@@ -7,13 +7,13 @@ use crate::{
     tracker,
 };
 
+use std::net::SocketAddr;
+use std::sync::{Arc, RwLock};
+
 use anyhow::{Context, Result};
 use bitvec::prelude::*;
 use tokio::{sync::broadcast, task::JoinSet};
 use tracing::{Instrument, debug, error, info, warn};
-
-use std::net::SocketAddr;
-use std::sync::{Arc, RwLock};
 
 pub struct Client {
     config: Config,

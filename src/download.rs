@@ -10,12 +10,11 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use anyhow::{Context, Result};
+use bitvec::prelude::*;
 use bytes::{Bytes, BytesMut};
 use sha1::{Digest, Sha1};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tracing::{debug, info, instrument, warn};
-
-use bitvec::prelude::*;
 
 /// A data structure representing information for downloading a file from a `.torrent` file.
 #[derive(Debug, Clone)]

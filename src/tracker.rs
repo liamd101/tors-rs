@@ -1,14 +1,12 @@
+use crate::parsing::Metadata;
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 
-use crate::parsing::Metadata;
-
+use anyhow::{Context, Result};
 use serde::de::{self, Error, Visitor};
 use serde::{Deserialize, Deserializer};
-
-use anyhow::{Context, Result};
 use tokio::net::TcpListener;
-
 use tracing::debug;
 
 #[derive(Debug, Deserialize)]

@@ -1,8 +1,8 @@
+use std::fmt;
+
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha1::{Digest, Sha1};
-use std::fmt;
-
 use tracing::debug;
 
 #[allow(dead_code)]
