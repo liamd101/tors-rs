@@ -1,8 +1,11 @@
 use std::fmt;
+use std::io::SeekFrom;
 
+use anyhow::Context;
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha1::{Digest, Sha1};
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tracing::debug;
 
 #[allow(dead_code)]
@@ -117,6 +120,49 @@ impl Metadata {
                 Ok(out)
             }
         }
+    }
+
+    pub async fn get_piece_data(
+        &self,
+        piece_idx: u64,
+        begin: u64,
+        data_len: u64,
+    ) -> anyhow::Result<Vec<u8>> {
+        let mut piece_data = vec![0u8; data_len as usize];
+
+        let output_dir = match self.info.torr_type {
+            TorrentType::MultiFile { .. } => self.info.name.clone(),
+            TorrentType::SingleFile { .. } => "out".to_string(),
+        };
+
+        let mut piece_position = 0;
+        for (file, file_offset, bytes_to_read) in
+            self.from_piece_block(piece_idx, begin, data_len)?
+        {
+            let mut filename = vec![output_dir.clone()];
+            filename.extend_from_slice(&file.path);
+            let filename = filename.join(std::path::MAIN_SEPARATOR_STR);
+            let mut out_file = tokio::fs::File::options()
+                .create(true)
+                .read(true)
+                .truncate(false)
+                .open(&filename)
+                .await
+                .with_context(|| format!("opening output file {filename}"))?;
+
+            out_file
+                .seek(SeekFrom::Start(file_offset))
+                .await
+                .with_context(|| format!("seeking to {file_offset}"))?;
+
+            out_file
+                .read_exact(&mut piece_data[piece_position..][..bytes_to_read as usize])
+                .await
+                .context("writing piece data to file")?;
+            piece_position += bytes_to_read as usize;
+        }
+
+        Ok(piece_data)
     }
 }
 

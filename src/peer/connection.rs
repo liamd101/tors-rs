@@ -63,7 +63,7 @@ fn handle_channel_message(
             warn!("Write half exited. Read half exiting.");
             Ok(true)
         }
-        Ok(ThreadUpdate::FileComplete) => Ok(true),
+        Ok(ThreadUpdate::Disconnect) => Ok(true),
         _ => Ok(false),
     }
 }
@@ -273,33 +273,11 @@ pub(super) async fn write_peer(
                     .context("writing Have payload")?;
             }
             Ok(ThreadUpdate::FileComplete) => {
-                let message_header = Message::cancel();
-                debug!("sending message: {message_header:?}");
-                for (piece, block) in requested.pending_requests() {
-                    let block_size = calculate_block_size(
-                        piece,
-                        block,
-                        peer_state.metadata.info.piece_length,
-                        peer_state.metadata.info.torr_type.len(),
-                    );
-                    stream
-                        .write_all(&message_header.as_bytes())
-                        .await
-                        .context("writing Cancel header")?;
-                    stream
-                        .write_u32(piece)
-                        .await
-                        .context("writing Cancel piece")?;
-                    stream
-                        .write_u32(block * BLOCK_SIZE)
-                        .await
-                        .context("writing Cancel piece")?;
-                    stream
-                        .write_u32(block_size)
-                        .await
-                        .context("writing Cancel piece")?;
-                }
-                // TODO: implement seeding to peers so we don't just disconnect like an ass
+                cancel_requests(&mut stream, &peer_state, requested.pending_requests())
+                    .await
+                    .context("Writing cancel messages")?;
+            }
+            Ok(ThreadUpdate::Disconnect) => {
                 break;
             }
         }
@@ -366,8 +344,74 @@ pub(super) async fn write_peer(
                 .await
                 .context("writing block_size")?;
         }
+
+        // if peer is interested in what we have, we want to send them some piece data
+        let mut req_queue = peer_state.request_queue.lock().await;
+        if peer_state.interested.load(Ordering::Relaxed) && !req_queue.is_empty() {
+            let (piece_index, begin, data_len) = req_queue
+                .pop_front()
+                .context("Reading from non-empty queue failed.")
+                .unwrap();
+
+            if !peer_state
+                .my_bitfield
+                .read()
+                .await
+                .get(piece_index as usize)
+                .as_deref()
+                .unwrap_or(&false)
+            {
+                warn!("Don't have requested piece");
+                continue;
+            }
+
+            let piece_data = peer_state
+                .metadata
+                .get_piece_data(piece_index as u64, begin as u64, data_len as u64)
+                .await
+                .context("Reading piece data from files")?;
+
+            stream
+                .write_all(&piece_data)
+                .await
+                .context("Writing piece data to stream")?;
+        }
     }
     Ok(ChildUpdates::Write(stream))
+}
+
+async fn cancel_requests(
+    stream: &mut tokio::io::WriteHalf<TcpStream>,
+    peer_state: &PeerState,
+    requests: Vec<(u32, u32)>,
+) -> Result<()> {
+    let message_header = Message::cancel();
+    debug!("sending message: {message_header:?}");
+    for (piece, block) in requests {
+        let block_size = calculate_block_size(
+            piece,
+            block,
+            peer_state.metadata.info.piece_length,
+            peer_state.metadata.info.torr_type.len(),
+        );
+        stream
+            .write_all(&message_header.as_bytes())
+            .await
+            .context("writing Cancel header")?;
+        stream
+            .write_u32(piece)
+            .await
+            .context("writing Cancel piece")?;
+        stream
+            .write_u32(block * BLOCK_SIZE)
+            .await
+            .context("writing Cancel begin")?;
+        stream
+            .write_u32(block_size)
+            .await
+            .context("writing Cancel data len")?;
+    }
+    Ok(())
 }
 
 /// Helper function for computing the correct blocksize for a given piece and block pair

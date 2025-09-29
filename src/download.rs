@@ -225,6 +225,7 @@ pub async fn monitor_file_progress(
                 info!("file complete received");
                 break;
             }
+            Ok(_) => {},
             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                 warn!("Lagged {n} messages.");

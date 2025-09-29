@@ -21,6 +21,8 @@ pub enum ThreadUpdate {
     /// Indicates that the entire file has been completed, and that any requests for the file
     /// should be cancelled.
     FileComplete,
+    /// Indicates that the program is exiting, and we should close all peer connections
+    Disconnect,
 }
 
 /// Looks for and binds a TcpListener to an open port between 6881 and 6889 inclusive.
