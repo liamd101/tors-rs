@@ -17,12 +17,14 @@ enum BlockState {
 use std::sync::Arc;
 
 use bitvec::prelude::*;
-use tokio::io::AsyncWriteExt;
-use tokio::net::TcpStream;
-use tokio::select;
-use tokio::sync::{RwLock, broadcast};
-use tokio::task::JoinSet;
-use tracing::{Instrument, debug, error, warn};
+use tokio::{
+    io::AsyncWriteExt,
+    net::TcpStream,
+    select,
+    sync::{RwLock, broadcast, watch},
+    task::JoinSet,
+};
+use tracing::{Instrument, debug, warn};
 
 use crate::{ThreadUpdate, parsing::Metadata};
 use state::PeerState;
@@ -47,22 +49,16 @@ pub async fn handle_peer(
     let (child_tx, mut child_rx) = broadcast::channel::<ThreadUpdate>(32);
 
     let peer_state = PeerState::new(metadata, my_bitfield);
+    let (choked_tx, choked_rx) = watch::channel(true);
 
     let current_span = tracing::Span::current();
     let read_tx = child_tx.clone();
     let read_rx = child_tx.subscribe();
     let read_state = peer_state.clone();
     set.spawn(async move {
-        match connection::read_peer(read_tx, read_rx, read_stream, read_state)
+        connection::read_peer(read_tx, read_rx, read_stream, read_state, choked_tx)
             .instrument(current_span)
             .await
-        {
-            Ok(stream) => Ok(stream),
-            Err(e) => {
-                error!("{e}");
-                Err(e)
-            }
-        }
     });
 
     let current_span = tracing::Span::current();
@@ -70,16 +66,9 @@ pub async fn handle_peer(
     let write_rx = child_tx.subscribe();
     let write_state = peer_state.clone();
     set.spawn(async move {
-        match connection::write_peer(write_tx, write_rx, write_stream, write_state)
+        connection::write_peer(write_tx, write_rx, write_stream, write_state, choked_rx)
             .instrument(current_span)
             .await
-        {
-            Ok(stream) => Ok(stream),
-            Err(e) => {
-                error!("{e}");
-                Err(e)
-            }
-        }
     });
 
     // Filter some messages to/from parent threads to children
@@ -92,7 +81,7 @@ pub async fn handle_peer(
                         Ok(ThreadUpdate::Downloaded(piece, block)) => {
                             parent_tx.send(ThreadUpdate::Downloaded(piece, block))?;
                         }
-                        Ok(ThreadUpdate::FileComplete) => break,
+                        Ok(ThreadUpdate::Disconnect) => break,
                         Ok(_) => {},
                         Err(broadcast::error::RecvError::Closed) => break,
                         Err(broadcast::error::RecvError::Lagged(n)) => {

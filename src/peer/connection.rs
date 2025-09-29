@@ -1,46 +1,34 @@
-use crate::{ThreadUpdate, parsing::TorrentType};
+use super::{BLOCK_SIZE, ChildUpdates, PeerState};
+use crate::ThreadUpdate;
 
-use super::{
-    BLOCK_SIZE, ChildUpdates,
-    message::{Message, MessageId},
-    pieces::PieceTracker,
-    state::PeerState,
-};
-
-use std::io::SeekFrom;
-use std::sync::atomic::Ordering;
-
-use anyhow::{Context, Result};
-use bitvec::prelude::*;
-use tokio::{
-    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
-    net::TcpStream,
-    select,
-    sync::broadcast,
-};
-use tracing::{debug, error, info, warn};
+use anyhow::Result;
+use tokio::net::TcpStream;
+use tokio::select;
+use tokio::sync::{broadcast, watch};
 
 pub(super) async fn read_peer(
     tx: broadcast::Sender<ThreadUpdate>,
     mut rx: broadcast::Receiver<ThreadUpdate>,
     mut stream: tokio::io::ReadHalf<TcpStream>,
     mut peer_state: PeerState,
+    mut choked_tx: watch::Sender<bool>,
 ) -> Result<ChildUpdates> {
     loop {
         select! {
             channel_result = rx.recv() => {
-                if handle_channel_message(channel_result)? {
+                if read_peer::handle_channel_message(channel_result)? {
                     break
                 }
             }
 
-            peer_result = read_message(&mut stream) => {
+            peer_result = read_peer::read_message(&mut stream) => {
                 if let Some(message) = peer_result? {
-                    process_message(
+                    read_peer::process_message(
                         message,
                         &tx,
                         &mut stream,
                         &mut peer_state,
+                        &mut choked_tx,
                     )
                     .await?;
                 }
@@ -51,205 +39,282 @@ pub(super) async fn read_peer(
     Ok(ChildUpdates::Read(stream))
 }
 
-fn handle_channel_message(
-    message: Result<ThreadUpdate, broadcast::error::RecvError>,
-) -> anyhow::Result<bool> {
-    match message {
-        Err(broadcast::error::RecvError::Lagged(_)) => {
-            error!("we are lagged somehow");
-            Err(anyhow::anyhow!("Stream lagged"))
-        }
-        Err(broadcast::error::RecvError::Closed) => {
-            warn!("Write half exited. Read half exiting.");
-            Ok(true)
-        }
-        Ok(ThreadUpdate::Disconnect) => Ok(true),
-        _ => Ok(false),
-    }
-}
-
-async fn read_message(
-    stream: &mut tokio::io::ReadHalf<TcpStream>,
-) -> anyhow::Result<Option<Message>> {
-    let mut length_bytes = [0u8; 4];
-
-    let bytes_read = stream.read_exact(&mut length_bytes).await?;
-    if bytes_read != 4 {
-        warn!("read {bytes_read} of message header");
-        return Ok(None);
-    }
-
-    let length = u32::from_be_bytes(length_bytes);
-    if length == 0 {
-        info!("Keep alive reeived. continuing");
-        return Ok(None);
-    }
-
-    let message_id = stream.read_u8().await?;
-    let message_id = MessageId::try_from(message_id).with_context(|| {
-        format!("message with length {length} and MessageID {message_id} received")
-    })?;
-
-    Ok(Some(Message {
-        length,
-        message_id: Some(message_id),
-    }))
-}
-
-async fn process_message(
-    message: Message,
-    tx: &broadcast::Sender<ThreadUpdate>,
-    stream: &mut tokio::io::ReadHalf<TcpStream>,
-    peer_state: &mut PeerState,
-) -> anyhow::Result<()> {
-    let Some(message_id) = message.message_id else {
-        return Ok(());
-    };
-
-    debug!("Received message: {message:?}");
-
-    match message_id {
-        MessageId::Choke | MessageId::UnChoke => {
-            peer_state
-                .choked
-                .store(matches!(message_id, MessageId::Choke), Ordering::Relaxed);
-        }
-
-        MessageId::Interested | MessageId::NotInterested => {
-            peer_state.interested.store(
-                matches!(message_id, MessageId::Interested),
-                Ordering::Relaxed,
-            );
-        }
-
-        MessageId::Have => {
-            let index: u32 = stream.read_u32().await?;
-            peer_state
-                .peer_bitfield
-                .write()
-                .await
-                .set(index as usize, true)
-        }
-
-        MessageId::BitField => {
-            let mut payload = vec![0u8; message.length as usize - 1];
-            stream.read_exact(&mut payload).await?;
-            let received_bitfield =
-                &BitVec::<u8, Msb0>::from_slice(&payload)[..peer_state.metadata.num_pieces()];
-            let mut peer_bitfield = peer_state.peer_bitfield.write().await;
-            for set_bit in received_bitfield.iter_ones() {
-                peer_bitfield.set(set_bit, true);
-            }
-            debug!("bitfield={peer_bitfield}");
-        }
-
-        MessageId::Request => {
-            let piece_index: u32 = stream.read_u32().await.context("reading piece index")?;
-            let begin: u32 = stream.read_u32().await.context("reading piece index")?;
-            let data_len: u32 = stream.read_u32().await.context("reading piece index")?;
-            peer_state
-                .request_queue
-                .lock()
-                .await
-                .push_back((piece_index, begin, data_len));
-        }
-
-        MessageId::Cancel => {
-            let piece_index: u32 = stream.read_u32().await.context("reading piece index")?;
-            let begin: u32 = stream.read_u32().await.context("reading piece index")?;
-            stream.read_u32().await.context("reading piece index")?;
-            peer_state
-                .request_queue
-                .lock()
-                .await
-                .retain(|&(req_piece_index, req_begin, _)| {
-                    !(req_piece_index == piece_index && req_begin == begin)
-                });
-        }
-
-        MessageId::Piece => {
-            let output_dir = match peer_state.metadata.info.torr_type {
-                TorrentType::MultiFile { .. } => peer_state.metadata.info.name.clone(),
-                TorrentType::SingleFile { .. } => "out".to_string(),
-            };
-
-            let piece_index: u32 = stream.read_u32().await.context("reading piece index")?;
-            let begin: u32 = stream.read_u32().await.context("reading block offset")?;
-            let data_len: u32 = message.length - 9;
-            let mut piece_data = vec![0u8; data_len as usize];
-            let bytes_read = stream
-                .read_exact(&mut piece_data)
-                .await
-                .context("reading piece data")?;
-            if bytes_read != data_len as usize {
-                error!("read {bytes_read} bytes instead of {data_len} bytes. closing connection.");
-                return Ok(()); // TODO: return error here
-            }
-
-            let mut piece_position = 0;
-            for (file, file_offset, bytes_to_write) in peer_state.metadata.from_piece_block(
-                piece_index as u64,
-                begin as u64,
-                data_len as u64,
-            )? {
-                let mut filename = vec![output_dir.clone()];
-                filename.extend_from_slice(&file.path);
-                let filename = filename.join(std::path::MAIN_SEPARATOR_STR);
-                let mut out_file = tokio::fs::File::options()
-                    .create(true)
-                    .write(true)
-                    .truncate(false)
-                    .open(&filename)
-                    .await
-                    .with_context(|| format!("opening output file {filename}"))?;
-                if out_file.metadata().await?.len() == 0 {
-                    out_file.set_len(file.length).await?;
-                }
-                out_file
-                    .seek(SeekFrom::Start(file_offset))
-                    .await
-                    .with_context(|| format!("seeking to {file_offset}"))?;
-                out_file
-                    .write_all(&piece_data[piece_position..][..bytes_to_write as usize])
-                    .await
-                    .context("writing piece data to file")?;
-                debug!(filename=?filename,"wrote {bytes_to_write} bytes to {file_offset}");
-                piece_position += bytes_to_write as usize;
-            }
-            debug!("Downloaded part of piece={piece_index}");
-            tx.send(ThreadUpdate::Downloaded(piece_index, begin / BLOCK_SIZE))?;
-        }
-
-        _ => todo!(),
-    }
-
-    Ok(())
-}
-
 pub(super) async fn write_peer(
     _tx: broadcast::Sender<ThreadUpdate>,
     mut rx: broadcast::Receiver<ThreadUpdate>,
     mut stream: tokio::io::WriteHalf<TcpStream>,
     peer_state: PeerState,
+    mut choked_rx: watch::Receiver<bool>,
 ) -> Result<ChildUpdates> {
     let mut am_interested = false;
-    let mut requested = PieceTracker::from_file_info(
+    let mut requested = super::pieces::PieceTracker::from_file_info(
         peer_state.metadata.info.torr_type.len(),
         peer_state.metadata.info.piece_length,
     );
     requested.update(&*peer_state.my_bitfield.read().await);
 
     loop {
-        match rx.try_recv() {
-            Err(broadcast::error::TryRecvError::Lagged(_)) => {
+        select! {
+            channel_result = rx.recv() => {
+                if write_peer::process_message(channel_result, &mut stream, &peer_state, &mut requested).await? {
+                    break;
+                }
+            }
+
+            _ = choked_rx.changed(), if !*choked_rx.borrow() => {
+                write_peer::while_unchoked(
+                    &mut stream,
+                    &peer_state,
+                    &mut requested,
+                    &mut am_interested,
+                    &mut choked_rx,
+                ).await?;
+            }
+        }
+    }
+    Ok(ChildUpdates::Write(stream))
+}
+
+mod read_peer {
+    use crate::{ThreadUpdate, parsing::TorrentType};
+
+    use crate::peer::{
+        BLOCK_SIZE,
+        message::{Message, MessageId},
+        state::PeerState,
+    };
+
+    use std::io::SeekFrom;
+    use std::sync::atomic::Ordering;
+
+    use anyhow::{Context, Result};
+    use bitvec::prelude::*;
+    use tokio::{
+        io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
+        net::TcpStream,
+        sync::{broadcast, watch},
+    };
+    use tracing::{debug, error, info, warn};
+
+    pub(super) fn handle_channel_message(
+        message: Result<ThreadUpdate, broadcast::error::RecvError>,
+    ) -> anyhow::Result<bool> {
+        match message {
+            Err(broadcast::error::RecvError::Lagged(_)) => {
+                error!("we are lagged somehow");
+                Err(anyhow::anyhow!("Stream lagged"))
+            }
+            Err(broadcast::error::RecvError::Closed) => {
+                warn!("Write half exited. Read half exiting.");
+                Ok(true)
+            }
+            Ok(ThreadUpdate::Disconnect) => Ok(true),
+            _ => Ok(false),
+        }
+    }
+
+    pub(super) async fn read_message(
+        stream: &mut tokio::io::ReadHalf<TcpStream>,
+    ) -> anyhow::Result<Option<Message>> {
+        let mut length_bytes = [0u8; 4];
+
+        let bytes_read = stream.read_exact(&mut length_bytes).await?;
+        if bytes_read != 4 {
+            warn!("read {bytes_read} of message header");
+            return Ok(None);
+        }
+
+        let length = u32::from_be_bytes(length_bytes);
+        if length == 0 {
+            info!("Keep alive reeived. continuing");
+            return Ok(None);
+        }
+
+        let message_id = stream.read_u8().await?;
+        let message_id = MessageId::try_from(message_id).with_context(|| {
+            format!("message with length {length} and MessageID {message_id} received")
+        })?;
+
+        Ok(Some(Message {
+            length,
+            message_id: Some(message_id),
+        }))
+    }
+
+    pub(super) async fn process_message(
+        message: Message,
+        tx: &broadcast::Sender<ThreadUpdate>,
+        stream: &mut tokio::io::ReadHalf<TcpStream>,
+        peer_state: &mut PeerState,
+        choked_tx: &mut watch::Sender<bool>,
+    ) -> anyhow::Result<()> {
+        let Some(message_id) = message.message_id else {
+            return Ok(());
+        };
+
+        debug!("Received message: {message:?}");
+
+        match message_id {
+            MessageId::Choke | MessageId::UnChoke => {
+                choked_tx.send(matches!(message_id, MessageId::Choke))?;
+            }
+
+            MessageId::Interested | MessageId::NotInterested => {
+                peer_state.interested.store(
+                    matches!(message_id, MessageId::Interested),
+                    Ordering::Relaxed,
+                );
+            }
+
+            MessageId::Have => {
+                let index: u32 = stream.read_u32().await?;
+                peer_state
+                    .peer_bitfield
+                    .write()
+                    .await
+                    .set(index as usize, true)
+            }
+
+            MessageId::BitField => {
+                let mut payload = vec![0u8; message.length as usize - 1];
+                stream.read_exact(&mut payload).await?;
+                let received_bitfield =
+                    &BitVec::<u8, Msb0>::from_slice(&payload)[..peer_state.metadata.num_pieces()];
+                let mut peer_bitfield = peer_state.peer_bitfield.write().await;
+                for set_bit in received_bitfield.iter_ones() {
+                    peer_bitfield.set(set_bit, true);
+                }
+                debug!("bitfield={peer_bitfield}");
+            }
+
+            MessageId::Request => {
+                let piece_index: u32 = stream.read_u32().await.context("reading piece index")?;
+                let begin: u32 = stream.read_u32().await.context("reading piece index")?;
+                let data_len: u32 = stream.read_u32().await.context("reading piece index")?;
+                peer_state
+                    .request_queue
+                    .lock()
+                    .await
+                    .push_back((piece_index, begin, data_len));
+            }
+
+            MessageId::Cancel => {
+                let piece_index: u32 = stream.read_u32().await.context("reading piece index")?;
+                let begin: u32 = stream.read_u32().await.context("reading piece index")?;
+                stream.read_u32().await.context("reading piece index")?;
+                peer_state
+                    .request_queue
+                    .lock()
+                    .await
+                    .retain(|&(req_piece_index, req_begin, _)| {
+                        !(req_piece_index == piece_index && req_begin == begin)
+                    });
+            }
+
+            MessageId::Piece => {
+                let output_dir = match peer_state.metadata.info.torr_type {
+                    TorrentType::MultiFile { .. } => peer_state.metadata.info.name.clone(),
+                    TorrentType::SingleFile { .. } => "out".to_string(),
+                };
+
+                let piece_index: u32 = stream.read_u32().await.context("reading piece index")?;
+                let begin: u32 = stream.read_u32().await.context("reading block offset")?;
+                let data_len: u32 = message.length - 9;
+                let mut piece_data = vec![0u8; data_len as usize];
+                let bytes_read = stream
+                    .read_exact(&mut piece_data)
+                    .await
+                    .context("reading piece data")?;
+                if bytes_read != data_len as usize {
+                    error!(
+                        "read {bytes_read} bytes instead of {data_len} bytes. closing connection."
+                    );
+                    return Ok(()); // TODO: return error here
+                }
+
+                let mut piece_position = 0;
+                for (file, file_offset, bytes_to_write) in peer_state.metadata.from_piece_block(
+                    piece_index as u64,
+                    begin as u64,
+                    data_len as u64,
+                )? {
+                    let mut filename = vec![output_dir.clone()];
+                    filename.extend_from_slice(&file.path);
+                    let filename = filename.join(std::path::MAIN_SEPARATOR_STR);
+                    let mut out_file = tokio::fs::File::options()
+                        .create(true)
+                        .write(true)
+                        .truncate(false)
+                        .open(&filename)
+                        .await
+                        .with_context(|| format!("opening output file {filename}"))?;
+                    if out_file.metadata().await?.len() == 0 {
+                        out_file.set_len(file.length).await?;
+                    }
+                    out_file
+                        .seek(SeekFrom::Start(file_offset))
+                        .await
+                        .with_context(|| format!("seeking to {file_offset}"))?;
+                    out_file
+                        .write_all(&piece_data[piece_position..][..bytes_to_write as usize])
+                        .await
+                        .context("writing piece data to file")?;
+                    debug!(filename=?filename,"wrote {bytes_to_write} bytes to {file_offset}");
+                    piece_position += bytes_to_write as usize;
+                }
+                debug!("Downloaded part of piece={piece_index}");
+                tx.send(ThreadUpdate::Downloaded(piece_index, begin / BLOCK_SIZE))?;
+            }
+
+            MessageId::Port => {
+                warn!("Port message received. This is unhandled.");
+                stream.read_u16().await.context("Reading peer DHT port")?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+mod write_peer {
+    use super::calculate_block_size;
+
+    use crate::{
+        ThreadUpdate,
+        peer::{
+            BLOCK_SIZE,
+            message::{Message, MessageId},
+            pieces::PieceTracker,
+            state::PeerState,
+        },
+    };
+
+    use std::sync::atomic::Ordering;
+
+    use anyhow::{Context, Result};
+    use tokio::{
+        io::AsyncWriteExt,
+        net::TcpStream,
+        select,
+        sync::{broadcast, watch},
+    };
+    use tracing::{debug, error, info, warn};
+
+    pub(super) async fn process_message(
+        update: Result<ThreadUpdate, broadcast::error::RecvError>,
+        stream: &mut tokio::io::WriteHalf<TcpStream>,
+        peer_state: &PeerState,
+        requested: &mut PieceTracker,
+    ) -> Result<bool> {
+        match update {
+            Err(broadcast::error::RecvError::Lagged(_)) => {
                 error!("we are lagged somehow");
                 todo!();
             }
-            Err(broadcast::error::TryRecvError::Closed) => {
+            Err(broadcast::error::RecvError::Closed) => {
                 info!("Write half exited. Read half exiting.");
-                break;
+                Ok(true)
             }
-            Err(broadcast::error::TryRecvError::Empty) => {}
             Ok(ThreadUpdate::Downloaded(piece, block)) => {
                 if requested
                     .mark_block_as_downloaded(piece as usize, block as usize)
@@ -257,6 +322,7 @@ pub(super) async fn write_peer(
                 {
                     warn!("unable to process piece={piece} block={block}");
                 }
+                Ok(false)
             }
             Ok(ThreadUpdate::Completed(piece)) => {
                 requested.mark_piece_as_downloaded(piece as usize);
@@ -271,25 +337,54 @@ pub(super) async fn write_peer(
                     .write_u32(piece)
                     .await
                     .context("writing Have payload")?;
+                Ok(false)
             }
             Ok(ThreadUpdate::FileComplete) => {
-                cancel_requests(&mut stream, &peer_state, requested.pending_requests())
+                cancel_requests(stream, peer_state, requested.pending_requests())
                     .await
                     .context("Writing cancel messages")?;
+                Ok(false)
             }
-            Ok(ThreadUpdate::Disconnect) => {
-                break;
+            Ok(ThreadUpdate::Disconnect) => Ok(true),
+        }
+    }
+
+    pub(super) async fn while_unchoked(
+        stream: &mut tokio::io::WriteHalf<TcpStream>,
+        peer_state: &PeerState,
+        requested: &mut PieceTracker,
+        am_interested: &mut bool,
+        choked_rx: &mut watch::Receiver<bool>,
+    ) -> Result<()> {
+        loop {
+            select! {
+                _ = choked_rx.changed() => {
+                    if *choked_rx.borrow() {
+                        break
+                    }
+                }
+
+                result = send_one_message(stream, peer_state, requested, am_interested) => {
+                    result?;
+                }
             }
         }
+        Ok(())
+    }
 
-        let choked = peer_state.choked.load(Ordering::Relaxed);
+    async fn send_one_message(
+        stream: &mut tokio::io::WriteHalf<TcpStream>,
+        peer_state: &PeerState,
+        requested: &mut PieceTracker,
+        am_interested: &mut bool,
+    ) -> Result<()> {
         /* If the peer has something that we ?want, have not sent
          * the peer an Interested message, send an interested message. */
         let peer_has_new_piece = (!peer_state.my_bitfield.read().await.clone()
             & peer_state.peer_bitfield.read().await.clone())
         .any();
 
-        if peer_has_new_piece && !am_interested {
+        if peer_has_new_piece && !*am_interested {
             let message = Message::interested();
             debug!("sending message: {message:?}");
 
@@ -298,10 +393,10 @@ pub(super) async fn write_peer(
                 .await
                 .context("writing Interested message")?;
 
-            am_interested = true;
+            *am_interested = true;
         }
 
-        if !peer_has_new_piece && am_interested {
+        if !peer_has_new_piece && *am_interested {
             let message = Message::not_interested();
             debug!("sending message: {message:?}");
 
@@ -310,11 +405,11 @@ pub(super) async fn write_peer(
                 .await
                 .context("writing NotInterested message")?;
 
-            am_interested = false;
+            *am_interested = false;
         }
 
         let peer_has = peer_state.peer_bitfield.read().await.iter_ones().collect();
-        if !choked && let Some((piece, block_num)) = requested.request(peer_has) {
+        if let Some((piece, block_num)) = requested.request(peer_has) {
             let message = Message::request();
             debug!("sending message: {message:?}");
             stream
@@ -362,7 +457,7 @@ pub(super) async fn write_peer(
                 .unwrap_or(&false)
             {
                 warn!("Don't have requested piece");
-                continue;
+                return Ok(());
             }
 
             let piece_data = peer_state
@@ -371,48 +466,70 @@ pub(super) async fn write_peer(
                 .await
                 .context("Reading piece data from files")?;
 
+            let message_header = Message {
+                message_id: Some(MessageId::Piece),
+                length: 13 + data_len,
+            };
+            stream
+                .write_all(&message_header.as_bytes())
+                .await
+                .context("Writing Piece header to stream")?;
+            stream
+                .write_u32(piece_index)
+                .await
+                .context("Writing Piece index")?;
+            stream.write_u32(begin).await.context("Writing Begin")?;
+            stream
+                .write_u32(data_len)
+                .await
+                .context("Writing Data length")?;
             stream
                 .write_all(&piece_data)
                 .await
                 .context("Writing piece data to stream")?;
         }
+
+        Ok(())
     }
-    Ok(ChildUpdates::Write(stream))
+
+    async fn cancel_requests(
+        stream: &mut tokio::io::WriteHalf<TcpStream>,
+        peer_state: &PeerState,
+        requests: Vec<(u32, u32)>,
+    ) -> Result<()> {
+        let message_header = Message::cancel();
+        debug!("sending message: {message_header:?}");
+        for (piece, block) in requests {
+            let block_size = super::calculate_block_size(
+                piece,
+                block,
+                peer_state.metadata.info.piece_length,
+                peer_state.metadata.info.torr_type.len(),
+            );
+            stream
+                .write_all(&message_header.as_bytes())
+                .await
+                .context("writing Cancel header")?;
+            stream
+                .write_u32(piece)
+                .await
+                .context("writing Cancel piece")?;
+            stream
+                .write_u32(block * BLOCK_SIZE)
+                .await
+                .context("writing Cancel begin")?;
+            stream
+                .write_u32(block_size)
+                .await
+                .context("writing Cancel data len")?;
+        }
+        Ok(())
+    }
 }
 
-async fn cancel_requests(
-    stream: &mut tokio::io::WriteHalf<TcpStream>,
-    peer_state: &PeerState,
-    requests: Vec<(u32, u32)>,
-) -> Result<()> {
-    let message_header = Message::cancel();
-    debug!("sending message: {message_header:?}");
-    for (piece, block) in requests {
-        let block_size = calculate_block_size(
-            piece,
-            block,
-            peer_state.metadata.info.piece_length,
-            peer_state.metadata.info.torr_type.len(),
-        );
-        stream
-            .write_all(&message_header.as_bytes())
-            .await
-            .context("writing Cancel header")?;
-        stream
-            .write_u32(piece)
-            .await
-            .context("writing Cancel piece")?;
-        stream
-            .write_u32(block * BLOCK_SIZE)
-            .await
-            .context("writing Cancel begin")?;
-        stream
-            .write_u32(block_size)
-            .await
-            .context("writing Cancel data len")?;
-    }
-    Ok(())
-}
+// for the write half, we want to only be writing when we are not choked
+// if we are choked, we want to wait until we are unchoked or until we receive a message from our
+// peer
 
 /// Helper function for computing the correct blocksize for a given piece and block pair
 fn calculate_block_size(
