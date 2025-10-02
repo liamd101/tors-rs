@@ -88,7 +88,7 @@ pub(super) async fn write_peer(
                        &mut stream,
                        &peer_state,
                        &mut requested,
-                       &mut am_interested,
+                       am_interested,
                     ).await?;
                 }
             }
@@ -398,38 +398,12 @@ mod write_peer {
         stream: &mut tokio::io::WriteHalf<TcpStream>,
         peer_state: &PeerState,
         requested: &mut PieceTracker,
-        am_interested: &mut bool,
+        am_interested: bool,
     ) -> Result<()> {
         /* If the peer has something that we ?want, have not sent
          * the peer an Interested message, send an interested message. */
-        let peer_has_new_piece = peer_state.should_be_interested().await;
-
-        if peer_has_new_piece && !*am_interested {
-            let message = Message::interested();
-            debug!("sending message: {message:?}");
-
-            stream
-                .write_all(&message.as_bytes())
-                .await
-                .context("writing Interested message")?;
-
-            *am_interested = true;
-        }
-
-        if !peer_has_new_piece && *am_interested {
-            let message = Message::not_interested();
-            debug!("sending message: {message:?}");
-
-            stream
-                .write_all(&message.as_bytes())
-                .await
-                .context("writing NotInterested message")?;
-
-            *am_interested = false;
-        }
-
         let peer_has = peer_state.peer_bitfield.read().await.iter_ones().collect();
-        if let Some((piece, block_num)) = requested.request(peer_has) {
+        if am_interested && let Some((piece, block_num)) = requested.request(peer_has) {
             let message = Message::request();
             debug!("sending message: {message:?}");
             stream
