@@ -1,7 +1,4 @@
-use super::{
-    BLOCK_SIZE, ChildUpdates, PeerState,
-    message::{Message, MessageId},
-};
+use super::{BLOCK_SIZE, ChildUpdates, PeerState, message::Message};
 use crate::ThreadUpdate;
 
 use anyhow::{Context, Result};
@@ -58,20 +55,7 @@ pub(super) async fn write_peer(
     requested.update(&*peer_state.my_bitfield.read().await);
 
     if peer_state.my_bitfield.read().await.any() {
-        let bitfield = peer_state.my_bitfield.read().await;
-        let payload: &[u8] = bitfield.as_raw_slice();
-        let header = Message {
-            length: 1 + bitfield.len() as u32,
-            message_id: Some(MessageId::BitField),
-        };
-        stream
-            .write_all(&header.as_bytes())
-            .await
-            .context("writing BitField header")?;
-        stream
-            .write_all(payload)
-            .await
-            .context("writing BitField payload")?;
+        write_peer::send_bitfield(&mut stream, &peer_state).await?;
     }
 
     loop {
@@ -514,6 +498,27 @@ mod write_peer {
                 .await
                 .context("writing Cancel data len")?;
         }
+        Ok(())
+    }
+
+    pub async fn send_bitfield(
+        stream: &mut tokio::io::WriteHalf<TcpStream>,
+        peer_state: &PeerState,
+    ) -> Result<()> {
+        let bitfield = peer_state.my_bitfield.read().await;
+        let payload: &[u8] = bitfield.as_raw_slice();
+        let header = Message {
+            length: 1 + bitfield.len() as u32,
+            message_id: Some(MessageId::BitField),
+        };
+        stream
+            .write_all(&header.as_bytes())
+            .await
+            .context("writing BitField header")?;
+        stream
+            .write_all(payload)
+            .await
+            .context("writing BitField payload")?;
         Ok(())
     }
 }
