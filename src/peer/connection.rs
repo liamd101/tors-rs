@@ -1,7 +1,11 @@
-use super::{BLOCK_SIZE, ChildUpdates, PeerState};
+use super::{
+    BLOCK_SIZE, ChildUpdates, PeerState,
+    message::{Message, MessageId},
+};
 use crate::ThreadUpdate;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::select;
 use tokio::sync::{broadcast, watch};
@@ -53,6 +57,23 @@ pub(super) async fn write_peer(
     );
     requested.update(&*peer_state.my_bitfield.read().await);
 
+    if peer_state.my_bitfield.read().await.any() {
+        let bitfield = peer_state.my_bitfield.read().await;
+        let payload: &[u8] = bitfield.as_raw_slice();
+        let header = Message {
+            length: 1 + bitfield.len() as u32,
+            message_id: Some(MessageId::BitField),
+        };
+        stream
+            .write_all(&header.as_bytes())
+            .await
+            .context("writing BitField header")?;
+        stream
+            .write_all(payload)
+            .await
+            .context("writing BitField payload")?;
+    }
+
     loop {
         select! {
             channel_result = rx.recv() => {
@@ -61,27 +82,50 @@ pub(super) async fn write_peer(
                 }
             }
 
-            _ = choked_rx.changed(), if !*choked_rx.borrow() => {
-                write_peer::while_unchoked(
-                    &mut stream,
-                    &peer_state,
-                    &mut requested,
-                    &mut am_interested,
-                    &mut choked_rx,
-                ).await?;
+            _ = tokio::time::sleep(tokio::time::Duration::from_millis(10)) => {
+                if !*choked_rx.borrow() {
+                    write_peer::send_one_round(
+                       &mut stream,
+                       &peer_state,
+                       &mut requested,
+                       &mut am_interested,
+                    ).await?;
+                }
+            }
+
+            _ = choked_rx.changed() => {
+                if *choked_rx.borrow() {
+                    break;
+                }
+            }
+
+            // TODO: have thing that tracks whether we're interested and sends messages accordingly
+            _ = peer_state.interest_changed.notified() => {
+                let should_be_interested = peer_state.should_be_interested().await;
+                if should_be_interested != am_interested {
+                    if should_be_interested {
+                        stream.write_all(&Message::interested().as_bytes()).await.context("Writing not interested")?;
+                    } else {
+                        stream.write_all(&Message::not_interested().as_bytes()).await.context("Writing not interested")?;
+                    }
+                    am_interested = should_be_interested;
+                }
             }
         }
     }
+
     Ok(ChildUpdates::Write(stream))
 }
 
 mod read_peer {
-    use crate::{ThreadUpdate, parsing::TorrentType};
-
-    use crate::peer::{
-        BLOCK_SIZE,
-        message::{Message, MessageId},
-        state::PeerState,
+    use crate::{
+        ThreadUpdate,
+        parsing::TorrentType,
+        peer::{
+            BLOCK_SIZE,
+            message::{Message, MessageId},
+            state::PeerState,
+        },
     };
 
     use std::io::SeekFrom;
@@ -168,11 +212,14 @@ mod read_peer {
 
             MessageId::Have => {
                 let index: u32 = stream.read_u32().await?;
-                peer_state
+                let prev = peer_state
                     .peer_bitfield
                     .write()
                     .await
-                    .set(index as usize, true)
+                    .replace(index as usize, true);
+                if !prev {
+                    peer_state.interest_changed.notify_one();
+                }
             }
 
             MessageId::BitField => {
@@ -185,6 +232,7 @@ mod read_peer {
                     peer_bitfield.set(set_bit, true);
                 }
                 debug!("bitfield={peer_bitfield}");
+                peer_state.interest_changed.notify_one();
             }
 
             MessageId::Request => {
@@ -263,6 +311,7 @@ mod read_peer {
                     piece_position += bytes_to_write as usize;
                 }
                 debug!("Downloaded part of piece={piece_index}");
+                debug!("receiver count={}", tx.receiver_count());
                 tx.send(ThreadUpdate::Downloaded(piece_index, begin / BLOCK_SIZE))?;
             }
 
@@ -277,8 +326,8 @@ mod read_peer {
 }
 
 mod write_peer {
-    use super::calculate_block_size;
 
+    use super::calculate_block_size;
     use crate::{
         ThreadUpdate,
         peer::{
@@ -292,12 +341,7 @@ mod write_peer {
     use std::sync::atomic::Ordering;
 
     use anyhow::{Context, Result};
-    use tokio::{
-        io::AsyncWriteExt,
-        net::TcpStream,
-        select,
-        sync::{broadcast, watch},
-    };
+    use tokio::{io::AsyncWriteExt, net::TcpStream, sync::broadcast};
     use tracing::{debug, error, info, warn};
 
     pub(super) async fn process_message(
@@ -316,6 +360,7 @@ mod write_peer {
                 Ok(true)
             }
             Ok(ThreadUpdate::Downloaded(piece, block)) => {
+                debug!("write thread recieved message");
                 if requested
                     .mark_block_as_downloaded(piece as usize, block as usize)
                     .is_none()
@@ -349,30 +394,7 @@ mod write_peer {
         }
     }
 
-    pub(super) async fn while_unchoked(
-        stream: &mut tokio::io::WriteHalf<TcpStream>,
-        peer_state: &PeerState,
-        requested: &mut PieceTracker,
-        am_interested: &mut bool,
-        choked_rx: &mut watch::Receiver<bool>,
-    ) -> Result<()> {
-        loop {
-            select! {
-                _ = choked_rx.changed() => {
-                    if *choked_rx.borrow() {
-                        break
-                    }
-                }
-
-                result = send_one_message(stream, peer_state, requested, am_interested) => {
-                    result?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    async fn send_one_message(
+    pub async fn send_one_round(
         stream: &mut tokio::io::WriteHalf<TcpStream>,
         peer_state: &PeerState,
         requested: &mut PieceTracker,
@@ -380,9 +402,7 @@ mod write_peer {
     ) -> Result<()> {
         /* If the peer has something that we ?want, have not sent
          * the peer an Interested message, send an interested message. */
-        let peer_has_new_piece = (!peer_state.my_bitfield.read().await.clone()
-            & peer_state.peer_bitfield.read().await.clone())
-        .any();
+        let peer_has_new_piece = peer_state.should_be_interested().await;
 
         if peer_has_new_piece && !*am_interested {
             let message = Message::interested();
@@ -442,12 +462,9 @@ mod write_peer {
 
         // if peer is interested in what we have, we want to send them some piece data
         let mut req_queue = peer_state.request_queue.lock().await;
-        if peer_state.interested.load(Ordering::Relaxed) && !req_queue.is_empty() {
-            let (piece_index, begin, data_len) = req_queue
-                .pop_front()
-                .context("Reading from non-empty queue failed.")
-                .unwrap();
-
+        if peer_state.interested.load(Ordering::Relaxed)
+            && let Some((piece_index, begin, data_len)) = req_queue.pop_front()
+        {
             if !peer_state
                 .my_bitfield
                 .read()
@@ -526,10 +543,6 @@ mod write_peer {
         Ok(())
     }
 }
-
-// for the write half, we want to only be writing when we are not choked
-// if we are choked, we want to wait until we are unchoked or until we receive a message from our
-// peer
 
 /// Helper function for computing the correct blocksize for a given piece and block pair
 fn calculate_block_size(
