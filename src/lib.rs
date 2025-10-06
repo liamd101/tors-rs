@@ -29,7 +29,7 @@ pub enum ThreadUpdate {
 /// This is per the BitTorrent spec, where these are the list of recommended ports.
 pub async fn bind_port() -> anyhow::Result<tokio::net::TcpListener> {
     for port_num in 6881..=6889 {
-        match tokio::net::TcpListener::bind(format!("127.0.0.1:{port_num}")).await {
+        match tokio::net::TcpListener::bind(format!("0.0.0.0:{port_num}")).await {
             Ok(out) => return Ok(out),
             Err(_) => continue,
         }

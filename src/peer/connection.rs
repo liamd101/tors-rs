@@ -419,9 +419,9 @@ mod write_peer {
         }
 
         // if peer is interested in what we have, we want to send them some piece data
-        let mut req_queue = peer_state.request_queue.lock().await;
         if peer_state.interested.load(Ordering::Relaxed)
-            && let Some((piece_index, begin, data_len)) = req_queue.pop_front()
+            && let Some((piece_index, begin, data_len)) =
+                peer_state.request_queue.lock().await.pop_front()
         {
             if !peer_state
                 .my_bitfield

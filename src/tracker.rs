@@ -138,9 +138,14 @@ fn format_tracker_params(
     peer_id: [u8; 20],
     metadata: &Metadata,
     listener: &TcpListener,
+    pieces_downloaded: usize,
 ) -> anyhow::Result<String> {
     let port = listener.local_addr().context("getting addr")?.port();
 
+    let downloaded = std::cmp::min(
+        pieces_downloaded as u64 * metadata.info.piece_length,
+        metadata.info.torr_type.len(),
+    );
     let mut params: HashMap<String, String> = HashMap::new();
     params.insert("port".into(), format!("{port}"));
     params.insert("event".into(), TrackerEvent::Started.to_string());
@@ -151,7 +156,10 @@ fn format_tracker_params(
         "peer_id".into(),
         urlencoding::encode_binary(&peer_id).to_string(),
     );
-    params.insert("left".into(), format!("{}", metadata.info.torr_type.len()));
+    params.insert(
+        "left".into(),
+        format!("{}", metadata.info.torr_type.len() - downloaded),
+    );
 
     let info_hash = metadata.info_hash();
     params.insert(
@@ -173,8 +181,10 @@ pub async fn make_request(
     peer_id: [u8; 20],
     metadata: &Metadata,
     listener: &TcpListener,
+    pieces_downloaded: usize,
 ) -> anyhow::Result<Response> {
-    let http_params = format_tracker_params(peer_id, metadata, listener)?;
+    let http_params = format_tracker_params(peer_id, metadata, listener, pieces_downloaded)
+        .context("Couldn't create tracker link")?;
 
     match &metadata.announce_list {
         Some(announce_list) => {
@@ -215,7 +225,16 @@ pub async fn make_request(
                 .context("invalid tracker URL")?;
 
             let body = res.bytes().await.context("error reading body")?;
-            let decoded: Response = serde_bencode::from_bytes(&body)?;
+            debug!(
+                "Body received as string: {}",
+                String::from_utf8_lossy(&body)
+            );
+            let decoded: Response = serde_bencode::from_bytes(&body).with_context(|| {
+                format!(
+                    "Reading body to Response struct {}",
+                    String::from_utf8_lossy(&body)
+                )
+            })?;
 
             return Ok(decoded);
         }

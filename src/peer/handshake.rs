@@ -1,3 +1,4 @@
+use anyhow::{Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -32,24 +33,24 @@ impl Handshake {
         bytes
     }
 
-    pub fn from_bytes(value: &[u8]) -> Result<Self, String> {
+    pub fn from_bytes(value: &[u8]) -> Result<Self> {
         if value.is_empty() {
-            return Err("Input cannot be empty".to_string());
+            anyhow::bail!("Input cannot be empty".to_string());
         }
         let pstrlen = value[0];
         if value.len() != 49 + (pstrlen as usize) {
-            return Err(format!("pstrlen/pstr is incorrect: {pstrlen}"));
+            anyhow::bail!(format!("pstrlen/pstr is incorrect: {pstrlen}"));
         }
         let pstr = String::from_utf8_lossy(&value[1..=(pstrlen as usize)]).to_string();
         let reserved: [u8; 8] = value[(pstrlen as usize + 1)..(pstrlen as usize + 9)]
             .try_into()
-            .map_err(|_| "Invalid reserved field length")?;
+            .context("Invalid reserved field length")?;
         let info_hash: [u8; 20] = value[(pstrlen as usize + 9)..(pstrlen as usize + 29)]
             .try_into()
-            .map_err(|_| "Invalid info_hash field length")?;
+            .context("Invalid info_hash field length")?;
         let peer_id: [u8; 20] = value[(pstrlen as usize + 29)..(pstrlen as usize + 49)]
             .try_into()
-            .map_err(|_| "Invalid peer_id field length")?;
+            .context("Invalid peer_id field length")?;
         Ok(Handshake {
             pstrlen,
             pstr,
@@ -70,19 +71,22 @@ impl Handshake {
     }
 }
 
-pub async fn try_handshake(
-    stream: &mut TcpStream,
-    handshake: &Handshake,
-) -> Result<bool, std::io::Error> {
+pub async fn try_handshake(stream: &mut TcpStream, handshake: &Handshake) -> Result<bool> {
     let handshake_bytes = handshake.to_bytes();
 
-    stream.write_all(&handshake_bytes).await?;
+    stream
+        .write_all(&handshake_bytes)
+        .await
+        .context("Writing handshake to peer")?;
 
     // first read will be 68 bytes the majority of the time according to the bittorrent spec
     let mut parts = vec![0u8; 68];
 
-    stream.read_exact(&mut parts).await?;
+    stream
+        .read_exact(&mut parts)
+        .await
+        .context("Received incorrect data")?;
 
-    let peer_response = Handshake::from_bytes(&parts).expect("invalid peer response");
+    let peer_response = Handshake::from_bytes(&parts).context("invalid peer response")?;
     Ok(peer_response.info_hash == handshake.info_hash)
 }

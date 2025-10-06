@@ -16,6 +16,7 @@ enum BlockState {
 
 use std::sync::Arc;
 
+use anyhow::Result;
 use bitvec::prelude::*;
 use tokio::{
     io::AsyncWriteExt,
@@ -41,7 +42,7 @@ pub async fn handle_peer(
     stream: TcpStream,
     metadata: Metadata,
     my_bitfield: Arc<RwLock<BitVec<u8, Msb0>>>,
-) -> Result<(), std::io::Error> {
+) -> Result<()> {
     debug!("handling peer connection");
 
     let (read_stream, write_stream) = tokio::io::split(stream);
@@ -125,8 +126,9 @@ pub async fn handle_peer(
 
     if let (Some(read), Some(write)) = (read_stream, write_stream) {
         let mut stream = read.unsplit(write);
-        stream.shutdown().await
+        stream.shutdown().await?;
+        Ok(())
     } else {
-        Err(std::io::Error::other("Read/Write thread failed"))
+        anyhow::bail!("Read/Write thread failed");
     }
 }

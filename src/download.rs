@@ -194,6 +194,10 @@ impl Download {
     pub fn bitfield(&self) -> Arc<RwLock<BitVec<u8, Msb0>>> {
         self.bitvec.clone()
     }
+
+    pub async fn num_completed_pieces(&self) -> usize {
+        self.bitvec.read().await.count_ones()
+    }
 }
 
 #[instrument(skip(download, tx, rx))]
