@@ -18,10 +18,10 @@ struct Args {
     max_peers: usize,
 }
 
-const CLIENT_NAME: &str = "qB";
-const CLIENT_VERSION_MAJOR: u8 = 5;
-const CLIENT_VERSION_MINOR: u8 = 0;
-const CLIENT_VERSION_PATCH: u8 = 5;
+const CLIENT_NAME: &str = "RS";
+const CLIENT_VERSION_MAJOR: u8 = 0;
+const CLIENT_VERSION_MINOR: u8 = 1;
+const CLIENT_VERSION_PATCH: u8 = 0;
 
 pub struct Config {
     pub file: String,

@@ -225,10 +225,6 @@ pub async fn make_request(
                 .context("invalid tracker URL")?;
 
             let body = res.bytes().await.context("error reading body")?;
-            debug!(
-                "Body received as string: {}",
-                String::from_utf8_lossy(&body)
-            );
             let decoded: Response = serde_bencode::from_bytes(&body).with_context(|| {
                 format!(
                     "Reading body to Response struct {}",
