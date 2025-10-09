@@ -14,15 +14,22 @@ use tokio::sync::RwLock;
 use anyhow::{Context, Result};
 use bitvec::prelude::*;
 use tokio::{net::TcpListener, select, sync::broadcast, task::JoinSet};
-use tracing::{Instrument, debug, info, warn};
+use tracing::{Instrument, info, warn};
 
+/// Instance of a BitTorrent Client. This struct handles downloading/seeding for a specific
+/// `.torrent` file.
 pub struct Client {
+    /// Configuration settings for the client.
     config: Config,
+    /// Metadata of the `.torrent` file being downloaded.
     metadata: Metadata,
+    /// Socket we are listening on.
     listener: TcpListener,
+    /// Current download status of the `.torrent` file.
     download: Download,
 }
 impl Client {
+    /// Create a new instance of a `Client` from a `Config` object.
     pub async fn new(config: Config) -> Result<Self> {
         let listener = crate::bind_port()
             .await
@@ -42,6 +49,7 @@ impl Client {
         })
     }
 
+    /// Begins running the client on the specified `.torrent` file.
     pub async fn run(self) -> Result<()> {
         let (tx, rx) = broadcast::channel::<ThreadUpdate>(32);
         let mut set: JoinSet<Result<()>> = JoinSet::new();
@@ -58,22 +66,9 @@ impl Client {
         });
 
         // if we still need to download stuff, then we'll reach out to peers
-        if self.download.is_downloaded().await {
-            info!("File is downloaded already. Seeding to peers");
-            tracker::make_request(
-                self.config.peer_id,
-                &self.metadata,
-                &self.listener,
-                self.metadata.num_pieces(),
-            )
-            .await
-            .context("Unable to contact tracker.")?;
-        } else {
-            let peers = self.discover_peers().await?;
-            debug!("tracker supplied {} peers", peers.len());
-            self.spawn_peer_connections(&mut set, peers, tx.clone(), my_bitfield.clone())
-                .await?;
-        }
+        let peers = self.discover_peers().await?;
+        self.spawn_peer_connections(&mut set, peers, tx.clone(), my_bitfield.clone())
+            .await?;
 
         info!("starting listening loop");
 
@@ -113,6 +108,7 @@ impl Client {
         Ok(())
     }
 
+    /// Contacts the tracker and returns a list of peers to contact
     async fn discover_peers(&self) -> Result<Vec<SocketAddr>> {
         let res = tracker::make_request(
             self.config.peer_id,
