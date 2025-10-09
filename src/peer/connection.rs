@@ -58,6 +58,12 @@ pub(super) async fn write_peer(
         write_peer::send_bitfield(&mut stream, &peer_state).await?;
     }
 
+    // optimistically unchoke peer
+    stream
+        .write_all(&Message::unchoke().as_bytes())
+        .await
+        .context("unchoking peer")?;
+
     loop {
         select! {
             channel_result = rx.recv() => {
@@ -88,7 +94,7 @@ pub(super) async fn write_peer(
                 let should_be_interested = peer_state.should_be_interested().await;
                 if should_be_interested != am_interested {
                     if should_be_interested {
-                        stream.write_all(&Message::interested().as_bytes()).await.context("Writing not interested")?;
+                        stream.write_all(&Message::interested().as_bytes()).await.context("Writing interested")?;
                     } else {
                         stream.write_all(&Message::not_interested().as_bytes()).await.context("Writing not interested")?;
                     }
@@ -386,6 +392,7 @@ mod write_peer {
     ) -> Result<()> {
         /* If the peer has something that we ?want, have not sent
          * the peer an Interested message, send an interested message. */
+        // TODO: change this to only request *NEW* pieces
         let peer_has = peer_state.peer_bitfield.read().await.iter_ones().collect();
         if am_interested && let Some((piece, block_num)) = requested.request(peer_has) {
             let message = Message::request();

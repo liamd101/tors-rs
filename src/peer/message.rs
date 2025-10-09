@@ -54,6 +54,20 @@ impl Message {
             message_id: Some(MessageId::Request),
         }
     }
+
+    pub fn unchoke() -> Self {
+        Self {
+            length: 1,
+            message_id: Some(MessageId::UnChoke),
+        }
+    }
+
+    pub fn choke() -> Self {
+        Self {
+            length: 1,
+            message_id: Some(MessageId::Choke),
+        }
+    }
 }
 
 /// Enum representing the type of messages supported by the BitTorrent protocol

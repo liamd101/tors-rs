@@ -25,7 +25,7 @@ use tokio::{
     sync::{RwLock, broadcast, watch},
     task::JoinSet,
 };
-use tracing::{Instrument, debug, warn};
+use tracing::{Instrument, info, warn};
 
 use crate::{ThreadUpdate, parsing::Metadata};
 use state::PeerState;
@@ -43,7 +43,7 @@ pub async fn handle_peer(
     metadata: Metadata,
     my_bitfield: Arc<RwLock<BitVec<u8, Msb0>>>,
 ) -> Result<()> {
-    debug!("handling peer connection");
+    info!("handling peer connection");
 
     let (read_stream, write_stream) = tokio::io::split(stream);
     let mut set = JoinSet::new();
