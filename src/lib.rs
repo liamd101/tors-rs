@@ -4,10 +4,12 @@ pub mod parsing;
 pub mod peer;
 pub mod torrent;
 pub mod tracker;
+pub use config::{Config, init_logging};
+pub use torrent::Client;
 
 #[derive(Clone, Debug)]
 /// Enum representing some messages that get sent between peer threads and parent threads.
-pub enum ThreadUpdate {
+pub(crate) enum ThreadUpdate {
     /// `Downloaded(piece_idx, block_idx)`
     /// Indicates that the given piece/block pair have been downloaded successfully.
     /// Sent from peer threads after successfully reading a block from a peer.
@@ -27,7 +29,7 @@ pub enum ThreadUpdate {
 
 /// Looks for and binds a TcpListener to an open port between 6881 and 6889 inclusive.
 /// This is per the BitTorrent spec, where these are the list of recommended ports.
-pub async fn bind_port() -> anyhow::Result<tokio::net::TcpListener> {
+pub(crate) async fn bind_port() -> anyhow::Result<tokio::net::TcpListener> {
     for port_num in 6881..=6889 {
         match tokio::net::TcpListener::bind(format!("0.0.0.0:{port_num}")).await {
             Ok(out) => return Ok(out),

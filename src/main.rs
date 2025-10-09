@@ -1,7 +1,4 @@
-use tors_rs::{
-    config::{Config, init_logging},
-    torrent::Client,
-};
+use tors_rs::{Client, Config, init_logging};
 
 use anyhow::{Context, Result};
 
