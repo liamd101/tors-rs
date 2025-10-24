@@ -7,6 +7,7 @@ mod tracker;
 pub use config::{Config, init_logging};
 pub use torrent::Client;
 
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 /// Enum representing some messages that get sent between peer threads and parent threads.
 pub(crate) enum ThreadUpdate {

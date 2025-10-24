@@ -271,7 +271,7 @@ mod read_peer {
                 }
 
                 let mut piece_position = 0;
-                for (file, file_offset, bytes_to_write) in peer_state.metadata.from_piece_block(
+                for (file, file_offset, bytes_to_write) in peer_state.metadata.file_info_from_piece_block(
                     piece_index as u64,
                     begin as u64,
                     data_len as u64,

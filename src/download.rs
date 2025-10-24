@@ -21,7 +21,6 @@ use tracing::{debug, info, instrument, warn};
 #[derive(Debug, Clone)]
 pub struct Download {
     /// The location of the file being downloaded
-    pub name: PathBuf,
     piece_length: u64,
     length: u64,
 
@@ -68,7 +67,6 @@ impl Download {
         };
 
         let mut out = Self {
-            name: PathBuf::from(&metadata.info.name),
             piece_length: metadata.info.piece_length,
             length: metadata.info.torr_type.len(),
             num_pieces,

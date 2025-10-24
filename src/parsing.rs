@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use std::fmt;
 use std::io::SeekFrom;
 
@@ -8,7 +9,6 @@ use sha1::{Digest, Sha1};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tracing::debug;
 
-#[allow(dead_code)]
 #[derive(Debug, Deserialize, Clone)]
 pub struct Metadata {
     /// URL of the tracker
@@ -63,7 +63,7 @@ impl Metadata {
     /// Takes in information about where we are starting a read, and how much data we are reading.
     /// Returns a list where each entry contains the File information, the offset into the file to
     /// read to, and the number of bytes to read to that file.
-    pub fn from_piece_block(
+    pub fn file_info_from_piece_block(
         &self,
         piece_idx: u64,
         begin: u64,
@@ -137,7 +137,7 @@ impl Metadata {
 
         let mut piece_position = 0;
         for (file, file_offset, bytes_to_read) in
-            self.from_piece_block(piece_idx, begin, data_len)?
+            self.file_info_from_piece_block(piece_idx, begin, data_len)?
         {
             let mut filename = vec![output_dir.clone()];
             filename.extend_from_slice(&file.path);

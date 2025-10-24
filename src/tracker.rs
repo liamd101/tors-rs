@@ -9,6 +9,7 @@ use serde::{Deserialize, Deserializer};
 use tokio::net::TcpListener;
 use tracing::debug;
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 pub enum Response {

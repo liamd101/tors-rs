@@ -62,6 +62,7 @@ impl Message {
         }
     }
 
+    #[allow(dead_code)]
     pub fn choke() -> Self {
         Self {
             length: 1,
