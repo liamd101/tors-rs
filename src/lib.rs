@@ -1,9 +1,9 @@
-pub mod config;
-pub mod download;
-pub mod parsing;
-pub mod peer;
-pub mod torrent;
-pub mod tracker;
+mod config;
+mod download;
+mod parsing;
+mod peer;
+mod torrent;
+mod tracker;
 pub use config::{Config, init_logging};
 pub use torrent::Client;
 

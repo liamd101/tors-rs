@@ -53,6 +53,7 @@ impl Config {
     }
 }
 
+/// Initialize `tracing` to support logging.
 pub fn init_logging(config: &Config) {
     let filter_level = if config.verbose { "debug" } else { "info" };
     tracing_subscriber::fmt()
