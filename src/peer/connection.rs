@@ -271,11 +271,10 @@ mod read_peer {
                 }
 
                 let mut piece_position = 0;
-                for (file, file_offset, bytes_to_write) in peer_state.metadata.file_info_from_piece_block(
-                    piece_index as u64,
-                    begin as u64,
-                    data_len as u64,
-                )? {
+                for (file, file_offset, bytes_to_write) in peer_state
+                    .metadata
+                    .file_info_from_piece_block(piece_index as u64, begin as u64, data_len as u64)?
+                {
                     let mut filename = vec![output_dir.clone()];
                     filename.extend_from_slice(&file.path);
                     let filename = filename.join(std::path::MAIN_SEPARATOR_STR);
