@@ -37,6 +37,7 @@ pub struct Download {
 impl Download {
     // TODO: update this error type to something more robust
     pub async fn new(metadata: &Metadata) -> Result<Self> {
+        info!("Initializing file download info");
         let num_pieces = metadata.num_pieces();
         let bitvec = Arc::new(RwLock::new(BitVec::<u8, Msb0>::repeat(false, num_pieces)));
 

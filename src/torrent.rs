@@ -13,9 +13,10 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use bitvec::prelude::*;
 use once_cell::sync::OnceCell;
+use rand::seq::SliceRandom;
 use tokio::sync::RwLock;
 use tokio::{net::TcpListener, select, sync::broadcast, task::JoinSet};
-use tracing::{Instrument, info, warn, error};
+use tracing::{Instrument, error, info, warn};
 
 pub(crate) static OUTPUT_DIR: OnceCell<Option<String>> = OnceCell::new();
 
@@ -39,7 +40,7 @@ impl Client {
             .context("Unable to find open port.")?;
 
         match OUTPUT_DIR.set(config.args.dir.clone()) {
-            Ok(()) => {},
+            Ok(()) => {}
             Err(e) => {
                 error!("{e:?}");
                 anyhow::bail!("Unable to initialize global variable");
@@ -62,6 +63,8 @@ impl Client {
 
     /// Begins running the client on the specified `.torrent` file.
     pub async fn run(self) -> Result<()> {
+        info!("Running BitTorrent client");
+
         let (tx, rx) = broadcast::channel::<ThreadUpdate>(32);
         let mut set: JoinSet<Result<()>> = JoinSet::new();
 
@@ -141,10 +144,11 @@ impl Client {
     async fn spawn_peer_connections(
         &self,
         task_set: &mut JoinSet<Result<()>>,
-        peers: Vec<SocketAddr>,
+        mut peers: Vec<SocketAddr>,
         tx: broadcast::Sender<ThreadUpdate>,
         bitfield: Arc<RwLock<BitVec<u8, Msb0>>>,
     ) -> Result<()> {
+        peers.shuffle(&mut rand::rng());
         for peer in peers.iter().take(self.config.args.max_peers) {
             let mut stream = match tokio::net::TcpStream::connect(peer)
                 .await
