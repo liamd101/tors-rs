@@ -39,7 +39,7 @@ tors-rs --file ubuntu-iso.torrent --max-peers 10
 
 ## Demo
 
-<video src="assets/demo.mp4" controls></video>
+<video src="https://raw.githubusercontent.com/liamd101/tors-rs/main/assets/demo.mp4" controls></video>
 
 ## License
 
