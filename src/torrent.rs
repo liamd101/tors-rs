@@ -35,7 +35,7 @@ impl Client {
             .await
             .context("Unable to find open port.")?;
 
-        let metadata = Metadata::new(&config.file).context("Unable to parse torrent file.")?;
+        let metadata = Metadata::new(&config.args.file).context("Unable to parse torrent file.")?;
 
         let download = Download::new(&metadata)
             .await
@@ -134,7 +134,7 @@ impl Client {
         tx: broadcast::Sender<ThreadUpdate>,
         bitfield: Arc<RwLock<BitVec<u8, Msb0>>>,
     ) -> Result<()> {
-        for peer in peers.iter().take(self.config.max_peers) {
+        for peer in peers.iter().take(self.config.args.max_peers) {
             let mut stream = match tokio::net::TcpStream::connect(peer)
                 .await
                 .context("couldn't connect to peer")

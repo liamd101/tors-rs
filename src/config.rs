@@ -4,18 +4,23 @@ use rand::prelude::*;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
-struct Args {
+#[command(version)]
+pub struct Args {
     /// Controls the log level of the program
-    #[arg(short, long)]
-    verbose: bool,
+    #[arg(short='v', long)]
+    pub verbose: bool,
 
     /// The input .torrent file to download
     #[arg(short, long, required = true)]
-    file: String,
+    pub file: String,
 
     /// The maximum number of peers to connect to at once
-    #[arg(short, long, default_value_t = 3)]
-    max_peers: usize,
+    #[arg(short, long, default_value_t = 10)]
+    pub max_peers: usize,
+
+    /// Directory to write the file contents to. Defaults to `out` or path specified by input file
+    #[arg(short='d', long, required = false)]
+    pub dir: String,
 }
 
 const CLIENT_NAME: &str = "RS";
@@ -24,9 +29,7 @@ const CLIENT_VERSION_MINOR: u8 = 1;
 const CLIENT_VERSION_PATCH: u8 = 0;
 
 pub struct Config {
-    pub file: String,
-    pub verbose: bool,
-    pub max_peers: usize,
+    pub args: Args,
     pub peer_id: [u8; 20],
 }
 impl Config {
@@ -45,9 +48,7 @@ impl Config {
         rand::rng().fill_bytes(&mut peer_id[8..]);
 
         Ok(Config {
-            file: args.file,
-            verbose: args.verbose,
-            max_peers: args.max_peers,
+            args,
             peer_id,
         })
     }
@@ -55,7 +56,7 @@ impl Config {
 
 /// Initialize `tracing` to support logging.
 pub fn init_logging(config: &Config) {
-    let filter_level = if config.verbose { "debug" } else { "info" };
+    let filter_level = if config.args.verbose { "debug" } else { "info" };
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::new(filter_level))
         .init();
