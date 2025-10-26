@@ -100,10 +100,10 @@ impl<'de> Visitor<'de> for PeersVisitor {
         while let Some(peer_dict) = seq.next_element::<PeerDict>()? {
             let ip_addr = peer_dict
                 .ip
-                .parse::<std::net::Ipv4Addr>()
+                .parse::<std::net::IpAddr>()
                 .map_err(|_| A::Error::custom(format!("Invalid IP address: {}", peer_dict.ip)))?;
             let port: u16 = peer_dict.port.try_into().unwrap();
-            let socket_addr = std::net::SocketAddr::new(std::net::IpAddr::V4(ip_addr), port);
+            let socket_addr = std::net::SocketAddr::new(ip_addr, port);
             peers.push(socket_addr);
         }
         Ok(Peers(peers))

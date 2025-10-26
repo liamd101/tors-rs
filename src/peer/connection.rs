@@ -7,6 +7,8 @@ use tokio::net::TcpStream;
 use tokio::select;
 use tokio::sync::{broadcast, watch};
 
+use tracing::debug;
+
 pub(super) async fn read_peer(
     tx: broadcast::Sender<ThreadUpdate>,
     mut rx: broadcast::Receiver<ThreadUpdate>,
@@ -54,16 +56,15 @@ pub(super) async fn write_peer(
     );
     requested.update(&*peer_state.my_bitfield.read().await);
 
-    if peer_state.my_bitfield.read().await.any() {
-        write_peer::send_bitfield(&mut stream, &peer_state).await?;
-    }
-
-    // optimistically unchoke peer
     stream
         .write_all(&Message::unchoke().as_bytes())
         .await
         .context("unchoking peer")?;
+    /*
+    write_peer::send_bitfield(&mut stream, &peer_state).await?;
+    */
 
+    // optimistically unchoke peer
     loop {
         select! {
             channel_result = rx.recv() => {
@@ -72,13 +73,13 @@ pub(super) async fn write_peer(
                 }
             }
 
-            _ = tokio::time::sleep(tokio::time::Duration::from_millis(10)) => {
+            _ = tokio::time::sleep(tokio::time::Duration::from_millis(100)) => {
                 if !*choked_rx.borrow() {
                     write_peer::send_one_round(
                        &mut stream,
                        &peer_state,
                        &mut requested,
-                       am_interested,
+                       &mut am_interested,
                     ).await?;
                 }
             }
@@ -86,6 +87,13 @@ pub(super) async fn write_peer(
             _ = choked_rx.changed() => {
                 if *choked_rx.borrow() {
                     break;
+                }
+
+                if !am_interested && peer_state.should_be_interested().await {
+                    debug!("sending interested message");
+                    stream.write_all(&Message::interested().as_bytes()).await.context("Writing interested")?;
+                    stream.flush().await.context("Flushing interested")?;
+                    am_interested = true;
                 }
             }
 
@@ -95,8 +103,12 @@ pub(super) async fn write_peer(
                 if should_be_interested != am_interested {
                     if should_be_interested {
                         stream.write_all(&Message::interested().as_bytes()).await.context("Writing interested")?;
+                        stream.flush().await.context("Flushing interested")?;
+                        debug!("sending interested message");
                     } else {
                         stream.write_all(&Message::not_interested().as_bytes()).await.context("Writing not interested")?;
+                        stream.flush().await.context("Flushing interested")?;
+                        debug!("sending not-interested message");
                     }
                     am_interested = should_be_interested;
                 }
@@ -128,7 +140,7 @@ mod read_peer {
         net::TcpStream,
         sync::{broadcast, watch},
     };
-    use tracing::{debug, error, info, warn};
+    use tracing::{debug, error, warn};
 
     pub(super) fn handle_channel_message(
         message: Result<ThreadUpdate, broadcast::error::RecvError>,
@@ -160,7 +172,7 @@ mod read_peer {
 
         let length = u32::from_be_bytes(length_bytes);
         if length == 0 {
-            info!("Keep alive reeived. continuing");
+            debug!("Keep alive reeived. continuing");
             return Ok(None);
         }
 
@@ -221,7 +233,7 @@ mod read_peer {
                 for set_bit in received_bitfield.iter_ones() {
                     peer_bitfield.set(set_bit, true);
                 }
-                debug!("bitfield={peer_bitfield}");
+                // debug!("bitfield={peer_bitfield}");
                 peer_state.interest_changed.notify_one();
             }
 
@@ -371,6 +383,7 @@ mod write_peer {
                     .write_u32(piece)
                     .await
                     .context("writing Have payload")?;
+                stream.flush().await.context("Flushing interested")?;
                 Ok(false)
             }
             Ok(ThreadUpdate::FileComplete) => {
@@ -387,15 +400,32 @@ mod write_peer {
         stream: &mut tokio::io::WriteHalf<TcpStream>,
         peer_state: &PeerState,
         requested: &mut PieceTracker,
-        am_interested: bool,
+        am_interested: &mut bool,
     ) -> Result<()> {
         /* If the peer has something that we ?want, have not sent
          * the peer an Interested message, send an interested message. */
         // TODO: change this to only request *NEW* pieces
+        /*
+        if *am_interested ^ peer_state.should_be_interested().await {
+            if peer_state.should_be_interested().await {
+                stream
+                    .write_all(&Message::interested().as_bytes())
+                    .await
+                    .context("Writing Interested message")?;
+            } else {
+                stream
+                    .write_all(&Message::not_interested().as_bytes())
+                    .await
+                    .context("Writing NotInterested message")?;
+            }
+            *am_interested = peer_state.should_be_interested().await;
+        }
+        */
+
         let peer_has = peer_state.peer_bitfield.read().await.iter_ones().collect();
-        if am_interested && let Some((piece, block_num)) = requested.request(peer_has) {
+        if *am_interested && let Some((piece, block_num)) = requested.request(peer_has) {
             let message = Message::request();
-            debug!("sending message: {message:?}");
+            // debug!("sending message: {message:?}");
             stream
                 .write_all(&message.as_bytes())
                 .await
@@ -409,7 +439,7 @@ mod write_peer {
             );
 
             let block_begin = block_num * BLOCK_SIZE;
-            debug!("requesting piece={piece} block_begin={block_begin}");
+            debug!("requesting piece={piece} block_begin={block_begin}, block_size={block_size}");
             stream
                 .write_u32(piece)
                 .await
@@ -422,6 +452,7 @@ mod write_peer {
                 .write_u32(block_size)
                 .await
                 .context("writing block_size")?;
+            stream.flush().await.context("Flushing interested")?;
         }
 
         // if peer is interested in what we have, we want to send them some piece data
@@ -507,6 +538,10 @@ mod write_peer {
         Ok(())
     }
 
+    #[allow(dead_code)]
+    /// Send our bitfield to a peer
+    /// For some reason, sending this as our first message seems to break a lot of peer
+    /// connections. Not sure what the reason is though
     pub async fn send_bitfield(
         stream: &mut tokio::io::WriteHalf<TcpStream>,
         peer_state: &PeerState,

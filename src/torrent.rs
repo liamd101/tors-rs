@@ -70,13 +70,11 @@ impl Client {
         self.spawn_peer_connections(&mut set, peers, tx.clone(), my_bitfield.clone())
             .await?;
 
-        info!("starting listening loop");
-
+        info!("Listening on port {}", self.listener.local_addr()?.port());
         loop {
-            info!("inside the loop");
-            let handshake = Handshake::v1(self.metadata.info_hash(), self.config.peer_id);
             select! {
                 Ok((mut stream, socket_addr)) = self.listener.accept() => {
+            let handshake = Handshake::v1(self.metadata.info_hash(), self.config.peer_id);
                     info!("Received connection from peer {socket_addr}");
                     if try_handshake(&mut stream, &handshake).await? {
                         let metadata = self.metadata.clone();
@@ -103,7 +101,6 @@ impl Client {
                 }
             }
         }
-        info!("ending listening loop");
 
         Ok(())
     }
@@ -138,15 +135,13 @@ impl Client {
                 .await
                 .context("couldn't connect to peer")
             else {
+                warn!("peer connection failed");
                 continue;
             };
 
             let handshake = Handshake::v1(self.metadata.info_hash(), self.config.peer_id);
 
-            match try_handshake(&mut stream, &handshake)
-                .await
-                .with_context(|| "sending handshake")
-            {
+            match try_handshake(&mut stream, &handshake).await {
                 Ok(true) => {
                     let metadata = self.metadata.clone();
                     let tx = tx.clone();
