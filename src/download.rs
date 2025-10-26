@@ -1,8 +1,7 @@
 use crate::{
     ThreadUpdate,
-    parsing::Hashes,
-    parsing::Metadata,
-    parsing::{File, TorrentType},
+    parsing::{File, Hashes, Metadata, TorrentType},
+    torrent::OUTPUT_DIR,
 };
 
 use std::io::SeekFrom;
@@ -43,7 +42,12 @@ impl Download {
 
         let files = match &metadata.info.torr_type {
             &TorrentType::SingleFile { length, .. } => {
-                let mut path: Vec<String> = vec![String::from("out")];
+                let output_dir = match OUTPUT_DIR.get().context("reading global variable").unwrap()
+                {
+                    Some(dir) => dir.clone(),
+                    None => String::from("out"),
+                };
+                let mut path: Vec<String> = vec![output_dir];
                 path.extend(
                     metadata
                         .info
@@ -53,17 +57,24 @@ impl Download {
                 );
                 vec![File { length, path }]
             }
-            TorrentType::MultiFile { files } => files
-                .iter()
-                .map(|file| {
-                    let mut path = vec![metadata.info.name.clone()];
-                    path.extend_from_slice(&file.path);
-                    File {
-                        length: file.length,
-                        path,
-                    }
-                })
-                .collect(),
+            TorrentType::MultiFile { files } => {
+                let output_dir = match OUTPUT_DIR.get().context("reading global variable").unwrap()
+                {
+                    Some(dir) => dir.clone(),
+                    None => String::from("out"),
+                };
+                files
+                    .iter()
+                    .map(|file| {
+                        let mut path: Vec<String> = vec![output_dir.clone()];
+                        path.extend_from_slice(&file.path);
+                        File {
+                            length: file.length,
+                            path,
+                        }
+                    })
+                    .collect()
+            }
         };
 
         let mut out = Self {

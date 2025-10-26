@@ -128,6 +128,7 @@ mod read_peer {
             message::{Message, MessageId},
             state::PeerState,
         },
+        torrent::OUTPUT_DIR,
     };
 
     use std::io::SeekFrom;
@@ -262,9 +263,12 @@ mod read_peer {
             }
 
             MessageId::Piece => {
-                let output_dir = match peer_state.metadata.info.torr_type {
-                    TorrentType::MultiFile { .. } => peer_state.metadata.info.name.clone(),
-                    TorrentType::SingleFile { .. } => "out".to_string(),
+                let output_dir = match OUTPUT_DIR.get().unwrap() {
+                    Some(dir) => dir.clone(),
+                    None => match peer_state.metadata.info.torr_type {
+                        TorrentType::MultiFile { .. } => peer_state.metadata.info.name.clone(),
+                        TorrentType::SingleFile { .. } => "out".to_string(),
+                    },
                 };
 
                 let piece_index: u32 = stream.read_u32().await.context("reading piece index")?;

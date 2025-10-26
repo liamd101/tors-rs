@@ -19,8 +19,8 @@ pub struct Args {
     pub max_peers: usize,
 
     /// Directory to write the file contents to. Defaults to `out` or path specified by input file
-    #[arg(short='d', long, required = false)]
-    pub dir: String,
+    #[arg(short='d', long)]
+    pub dir: Option<String>,
 }
 
 const CLIENT_NAME: &str = "RS";

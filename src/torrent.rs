@@ -9,12 +9,15 @@ use crate::{
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 
 use anyhow::{Context, Result};
 use bitvec::prelude::*;
+use once_cell::sync::OnceCell;
+use tokio::sync::RwLock;
 use tokio::{net::TcpListener, select, sync::broadcast, task::JoinSet};
-use tracing::{Instrument, info, warn};
+use tracing::{Instrument, info, warn, error};
+
+pub(crate) static OUTPUT_DIR: OnceCell<Option<String>> = OnceCell::new();
 
 /// Instance of a BitTorrent Client. This struct handles downloading/seeding for a specific
 /// `.torrent` file.
@@ -34,6 +37,14 @@ impl Client {
         let listener = crate::bind_port()
             .await
             .context("Unable to find open port.")?;
+
+        match OUTPUT_DIR.set(config.args.dir.clone()) {
+            Ok(()) => {},
+            Err(e) => {
+                error!("{e:?}");
+                anyhow::bail!("Unable to initialize global variable");
+            }
+        }
 
         let metadata = Metadata::new(&config.args.file).context("Unable to parse torrent file.")?;
 

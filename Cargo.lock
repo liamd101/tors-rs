@@ -1478,6 +1478,7 @@ dependencies = [
  "bitvec",
  "bytes",
  "clap",
+ "once_cell",
  "rand",
  "reqwest",
  "serde",
