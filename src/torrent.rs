@@ -76,7 +76,11 @@ impl Client {
                 Ok((mut stream, socket_addr)) = self.listener.accept() => {
             let handshake = Handshake::v1(self.metadata.info_hash(), self.config.peer_id);
                     info!("Received connection from peer {socket_addr}");
-                    if try_handshake(&mut stream, &handshake).await? {
+                    let Ok(passed_handshake) = try_handshake(&mut stream, &handshake).await else {
+                        warn!("Peer handshake failed");
+                        continue;
+                    };
+                    if passed_handshake {
                         let metadata = self.metadata.clone();
                         let tx = tx.clone();
                         let thread_rx = tx.subscribe();
@@ -131,12 +135,15 @@ impl Client {
         bitfield: Arc<RwLock<BitVec<u8, Msb0>>>,
     ) -> Result<()> {
         for peer in peers.iter().take(self.config.max_peers) {
-            let Ok(mut stream) = tokio::net::TcpStream::connect(peer)
+            let mut stream = match tokio::net::TcpStream::connect(peer)
                 .await
                 .context("couldn't connect to peer")
-            else {
-                warn!("peer connection failed");
-                continue;
+            {
+                Ok(stream) => stream,
+                Err(e) => {
+                    warn!("peer connection failed: {e}");
+                    continue;
+                }
             };
 
             let handshake = Handshake::v1(self.metadata.info_hash(), self.config.peer_id);

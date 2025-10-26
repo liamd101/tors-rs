@@ -85,7 +85,7 @@ pub async fn try_handshake(stream: &mut TcpStream, handshake: &Handshake) -> Res
     stream
         .read_exact(&mut parts)
         .await
-        .context("Received incorrect data")?;
+        .context("Receiving handshake")?;
 
     let peer_response = Handshake::from_bytes(&parts).context("invalid peer response")?;
     Ok(peer_response.info_hash == handshake.info_hash)
