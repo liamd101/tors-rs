@@ -40,10 +40,10 @@ impl Config {
         peer_id[0] = b'-';
         peer_id[1] = CLIENT_NAME.bytes().collect::<Vec<u8>>()[0];
         peer_id[2] = CLIENT_NAME.bytes().collect::<Vec<u8>>()[1];
-        peer_id[3] = CLIENT_VERSION_MAJOR;
-        peer_id[4] = CLIENT_VERSION_MINOR;
-        peer_id[5] = CLIENT_VERSION_PATCH;
-        peer_id[6] = 0;
+        peer_id[3] = b'0' + CLIENT_VERSION_MAJOR;
+        peer_id[4] = b'0' + CLIENT_VERSION_MINOR;
+        peer_id[5] = b'0' + CLIENT_VERSION_PATCH;
+        peer_id[6] = b'0' + 0;
         peer_id[7] = b'-';
         rand::rng().fill_bytes(&mut peer_id[8..]);
 
