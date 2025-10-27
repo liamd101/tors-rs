@@ -87,14 +87,17 @@ impl Download {
             bitvec,
         };
 
-        debug!("initializing files");
-        out.initialize_files().await?;
-        debug!("checking downloaded pieces");
-        out.update_downloads().await?;
+        if !out.initialize_files().await? {
+            debug!("checking downloaded pieces");
+            out.update_downloads().await?;
+        }
         Ok(out)
     }
 
-    async fn initialize_files(&self) -> Result<()> {
+    /// Initializes all files to be downloaded
+    /// Returns true if all files were just created, false if any already existed
+    async fn initialize_files(&self) -> Result<bool> {
+        let mut initialized_all = true;
         for file in &self.files {
             let path = file.path.iter().collect::<PathBuf>();
             if let Some(parent) = path.parent() {
@@ -113,9 +116,11 @@ impl Download {
             if file_handle.metadata().await?.len() == 0 {
                 file_handle.set_len(file.length).await?;
                 debug!("initialized file {path:?} (size: {})", file.length);
+            } else {
+                initialized_all = false;
             }
         }
-        Ok(())
+        Ok(initialized_all)
     }
 
     pub async fn is_downloaded(&self) -> bool {
@@ -236,7 +241,7 @@ pub async fn monitor_file_progress(
                 );
             }
             Ok(ThreadUpdate::FileComplete) => {
-                info!("file complete received");
+                info!("Finished downloading file");
                 break;
             }
             Ok(_) => {}

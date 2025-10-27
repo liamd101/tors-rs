@@ -23,7 +23,7 @@ pub struct Args {
     pub dir: Option<String>,
 
     /// Whether or not to use the Fast Extension (BEP0006)
-    #[arg(short='f', long, default_value_t=true)]
+    #[arg(short='F', long)]
     pub fast_extension: bool,
 }
 
