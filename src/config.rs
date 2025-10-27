@@ -21,6 +21,10 @@ pub struct Args {
     /// Directory to write the file contents to. Defaults to `out` or path specified by input file
     #[arg(short='d', long)]
     pub dir: Option<String>,
+
+    /// Whether or not to use the Fast Extension (BEP0006)
+    #[arg(short='f', long, default_value_t=true)]
+    pub fast_extension: bool,
 }
 
 const CLIENT_NAME: &str = "RS";

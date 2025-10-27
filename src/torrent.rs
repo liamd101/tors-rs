@@ -90,8 +90,8 @@ impl Client {
         loop {
             select! {
                 Ok((mut stream, socket_addr)) = self.listener.accept() => {
-                    let handshake = Handshake::v1(self.metadata.info_hash(), self.config.peer_id);
-                    info!("Received connection from peer {socket_addr}");
+                    let handshake = Handshake::v1(&self.config, self.metadata.info_hash(), self.config.peer_id);
+                    debug!("Received connection from peer {socket_addr}");
                     let Ok(handshake) = try_handshake(&mut stream, &handshake).await else {
                         warn!("Peer handshake failed");
                         continue;
@@ -165,7 +165,8 @@ impl Client {
                 }
             };
 
-            let handshake = Handshake::v1(self.metadata.info_hash(), self.config.peer_id);
+            let handshake =
+                Handshake::v1(&self.config, self.metadata.info_hash(), self.config.peer_id);
 
             match try_handshake(&mut stream, &handshake).await {
                 Ok(Some(handshake)) => {

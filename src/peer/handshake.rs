@@ -1,6 +1,26 @@
+use crate::Config;
+
 use anyhow::{Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Reserved([u8; 8]);
+impl Reserved {
+    pub fn as_bytes(&self) -> [u8; 8] {
+        self.0
+    }
+}
+
+impl From<&Config> for Reserved {
+    fn from(value: &Config) -> Self {
+        let mut bytes = [0u8; 8];
+        if value.args.fast_extension {
+            bytes[7] |= 0x04;
+        }
+        Self(bytes)
+    }
+}
 
 /// The handshake is a required message and must be the first message transmitted by the client
 /// It is (49+len(pstr)) bytes long
@@ -12,7 +32,7 @@ pub struct Handshake {
     pub pstr: String,
     /// 8 reserved bits. All current implementations use all zeroes. Each bit in these bytes can be
     /// used to change the behavior of the protocol
-    pub reserved: [u8; 8],
+    pub reserved: Reserved,
     /// 20-byte SHA1 hash of the info key in the metainfo file. Same info_hash that is transmitted
     /// in tracker requests
     pub info_hash: [u8; 20],
@@ -27,7 +47,7 @@ impl Handshake {
         let mut bytes: Vec<u8> = Vec::with_capacity(total_len);
         bytes.push(self.pstrlen);
         bytes.extend_from_slice(self.pstr.as_bytes());
-        bytes.extend_from_slice(&self.reserved);
+        bytes.extend_from_slice(&self.reserved.as_bytes());
         bytes.extend_from_slice(&self.info_hash);
         bytes.extend_from_slice(&self.peer_id);
         bytes
@@ -45,6 +65,7 @@ impl Handshake {
         let reserved: [u8; 8] = value[(pstrlen as usize + 1)..(pstrlen as usize + 9)]
             .try_into()
             .context("Invalid reserved field length")?;
+        let reserved = Reserved(reserved);
         let info_hash: [u8; 20] = value[(pstrlen as usize + 9)..(pstrlen as usize + 29)]
             .try_into()
             .context("Invalid info_hash field length")?;
@@ -60,18 +81,21 @@ impl Handshake {
         })
     }
 
-    pub fn v1(info_hash: [u8; 20], peer_id: [u8; 20]) -> Self {
+    pub fn v1(config: &Config, info_hash: [u8; 20], peer_id: [u8; 20]) -> Self {
         Self {
             info_hash,
             peer_id,
             pstrlen: 19,
             pstr: "BitTorrent protocol".to_string(),
-            reserved: [0u8; 8],
+            reserved: Reserved::from(config),
         }
     }
 }
 
-pub async fn try_handshake(stream: &mut TcpStream, handshake: &Handshake) -> Result<Option<Handshake>> {
+pub async fn try_handshake(
+    stream: &mut TcpStream,
+    handshake: &Handshake,
+) -> Result<Option<Handshake>> {
     let handshake_bytes = handshake.to_bytes();
 
     stream
