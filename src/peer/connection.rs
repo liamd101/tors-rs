@@ -1,4 +1,7 @@
-use super::{BLOCK_SIZE, ChildUpdates, PeerState, message::Message};
+use super::{
+    BLOCK_SIZE, ChildUpdates, PeerState,
+    message::{Message, MessageId},
+};
 use crate::ThreadUpdate;
 
 use anyhow::{Context, Result};
@@ -61,6 +64,9 @@ pub(super) async fn write_peer(
         .write_all(&Message::unchoke().as_bytes())
         .await
         .context("unchoking peer")?;
+    peer_state
+        .am_choking
+        .store(false, std::sync::atomic::Ordering::Release);
 
     loop {
         select! {
@@ -70,9 +76,19 @@ pub(super) async fn write_peer(
                 }
             }
 
-            Some(request_result) = peer_state.request_queue.recv() => {
-                let (piece_idx, begin, data_len) = request_result;
-                debug!("received request");
+            Some((piece_idx, begin, data_len)) = peer_state.request_queue.recv() => {
+                if peer_state.am_choking.load(std::sync::atomic::Ordering::Relaxed) {
+                    continue;
+                }
+                let data = peer_state.metadata.get_piece_data(piece_idx as u64, begin as u64, data_len as u64).await.context("getting piece data")?;
+                stream.write_all(&Message {
+                    length: data.len() as u32 + 9,
+                    message_id: Some(MessageId::Piece),
+                }.as_bytes()).await?;
+                stream.write_u32(piece_idx).await.context("sending piece index")?;
+                stream.write_u32(begin).await.context("sending begin")?;
+                stream.write_all(&data).await.context("writing piece data")?;
+                debug!("sent piece_idx={piece_idx} begin={begin} data_len={data_len}");
             }
 
             _ = tokio::time::sleep(tokio::time::Duration::from_millis(10)) => {
@@ -236,20 +252,20 @@ mod read_peer {
                 let piece_index: u32 = stream.read_u32().await.context("reading piece index")?;
                 let begin: u32 = stream.read_u32().await.context("reading piece index")?;
                 let data_len: u32 = stream.read_u32().await.context("reading piece index")?;
-                if *peer_state.peer_choking.0.lock().await {
-                    return Ok(());
-                }
                 peer_state
                     .request_queue
                     .send((piece_index, begin, data_len))
                     .await?;
+                debug!("piece_index={piece_index}");
+                debug!("begin={begin}");
+                debug!("data_len={data_len}");
             }
 
             MessageId::Cancel => {
                 let piece_index: u32 = stream.read_u32().await.context("reading piece index")?;
                 let begin: u32 = stream.read_u32().await.context("reading block begin")?;
                 stream.read_u32().await.context("reading data len")?;
-                if *peer_state.peer_choking.0.lock().await {
+                if peer_state.am_choking.load(Ordering::Relaxed) {
                     return Ok(());
                 }
                 peer_state
