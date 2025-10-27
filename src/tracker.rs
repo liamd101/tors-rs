@@ -217,10 +217,8 @@ pub async fn make_request(
                 _ => anyhow::bail!("Unsupported Tracker scheme"),
             }
 
-            debug!("announce");
-
             let announce = format!("{}?{}", metadata.announce, http_params);
-            debug!("{announce}");
+            debug!("announce url={announce}");
             let res = reqwest::get(announce)
                 .await
                 .context("invalid tracker URL")?;

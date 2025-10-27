@@ -136,7 +136,6 @@ impl Client {
         )
         .await
         .context("Unable to contact tracker.")?;
-        debug!("response={res:?}");
         match res {
             tracker::Response::Success { peers, .. } => Ok(peers.0),
             tracker::Response::Error { failure_reason } => {
@@ -152,7 +151,7 @@ impl Client {
         tx: broadcast::Sender<ThreadUpdate>,
         bitfield: Arc<RwLock<BitVec<u8, Msb0>>>,
     ) -> Result<()> {
-        info!("peers={peers:?}");
+        debug!("peers={peers:?}");
         peers.shuffle(&mut rand::rng());
         for peer in peers.iter().take(self.config.args.max_peers) {
             let mut stream = match tokio::net::TcpStream::connect(peer)
@@ -175,6 +174,7 @@ impl Client {
                     let thread_rx = tx.subscribe();
                     let bitfield = bitfield.clone();
                     let reserved = my_handshake.reserved & handshake.reserved;
+                    debug!("reserved bytes={reserved:?}");
 
                     task_set.spawn(async move {
                         let span = tracing::info_span!("peer", peer_id = %String::from_utf8_lossy(&handshake.peer_id));
