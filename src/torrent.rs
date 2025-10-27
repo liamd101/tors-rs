@@ -16,7 +16,7 @@ use once_cell::sync::OnceCell;
 use rand::seq::SliceRandom;
 use tokio::sync::RwLock;
 use tokio::{net::TcpListener, select, sync::broadcast, task::JoinSet};
-use tracing::{Instrument, error, info, warn, debug};
+use tracing::{Instrument, debug, error, info, warn};
 
 pub(crate) static OUTPUT_DIR: OnceCell<Option<String>> = OnceCell::new();
 
@@ -90,20 +90,20 @@ impl Client {
         loop {
             select! {
                 Ok((mut stream, socket_addr)) = self.listener.accept() => {
-            let handshake = Handshake::v1(self.metadata.info_hash(), self.config.peer_id);
+                    let handshake = Handshake::v1(self.metadata.info_hash(), self.config.peer_id);
                     info!("Received connection from peer {socket_addr}");
-                    let Ok(passed_handshake) = try_handshake(&mut stream, &handshake).await else {
+                    let Ok(handshake) = try_handshake(&mut stream, &handshake).await else {
                         warn!("Peer handshake failed");
                         continue;
                     };
-                    if passed_handshake {
+                    if let Some(handshake) = handshake {
                         let metadata = self.metadata.clone();
                         let tx = tx.clone();
                         let thread_rx = tx.subscribe();
                         let bitfield = my_bitfield.clone();
 
                         set.spawn(async move {
-                            let span = tracing::info_span!("peer", peer_addr = %socket_addr);
+                            let span = tracing::info_span!("peer", peer_id=%String::from_utf8_lossy(&handshake.peer_id));
                             handle_peer(tx, thread_rx, stream, metadata, bitfield)
                                 .instrument(span)
                                 .await
@@ -168,21 +168,20 @@ impl Client {
             let handshake = Handshake::v1(self.metadata.info_hash(), self.config.peer_id);
 
             match try_handshake(&mut stream, &handshake).await {
-                Ok(true) => {
+                Ok(Some(handshake)) => {
                     let metadata = self.metadata.clone();
                     let tx = tx.clone();
                     let thread_rx = tx.subscribe();
-                    let peer = *peer;
                     let bitfield = bitfield.clone();
 
                     task_set.spawn(async move {
-                        let span = tracing::info_span!("peer", peer_addr = %peer);
+                        let span = tracing::info_span!("peer", peer_id = %String::from_utf8_lossy(&handshake.peer_id));
                         handle_peer(tx, thread_rx, stream, metadata, bitfield)
                             .instrument(span)
                             .await
                     });
                 }
-                Ok(false) => warn!("{peer} failed handshake"),
+                Ok(None) => continue,
                 Err(e) => warn!("Failed to connect to {peer}: {e:?}"),
             }
         }

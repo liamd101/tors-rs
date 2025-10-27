@@ -71,7 +71,7 @@ impl Handshake {
     }
 }
 
-pub async fn try_handshake(stream: &mut TcpStream, handshake: &Handshake) -> Result<bool> {
+pub async fn try_handshake(stream: &mut TcpStream, handshake: &Handshake) -> Result<Option<Handshake>> {
     let handshake_bytes = handshake.to_bytes();
 
     stream
@@ -88,5 +88,9 @@ pub async fn try_handshake(stream: &mut TcpStream, handshake: &Handshake) -> Res
         .context("Receiving handshake")?;
 
     let peer_response = Handshake::from_bytes(&parts).context("invalid peer response")?;
-    Ok(peer_response.info_hash == handshake.info_hash)
+    if peer_response.info_hash == handshake.info_hash {
+        Ok(Some(peer_response))
+    } else {
+        Ok(None)
+    }
 }
