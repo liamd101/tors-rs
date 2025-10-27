@@ -22,7 +22,7 @@ use tokio::{
     io::AsyncWriteExt,
     net::TcpStream,
     select,
-    sync::{RwLock, broadcast, watch},
+    sync::{RwLock, broadcast},
     task::JoinSet,
 };
 use tracing::{Instrument, info, warn};
@@ -49,15 +49,13 @@ pub async fn handle_peer(
     let mut set = JoinSet::new();
     let (child_tx, mut child_rx) = broadcast::channel::<ThreadUpdate>(32);
 
-    let peer_state = PeerState::new(metadata, my_bitfield);
-    let (choked_tx, choked_rx) = watch::channel(true);
+    let (sender, receiver) = PeerState::channel(metadata, my_bitfield);
 
     let current_span = tracing::Span::current();
     let read_tx = child_tx.clone();
     let read_rx = child_tx.subscribe();
-    let read_state = peer_state.clone();
     set.spawn(async move {
-        connection::read_peer(read_tx, read_rx, read_stream, read_state, choked_tx)
+        connection::read_peer(read_tx, read_rx, read_stream, sender)
             .instrument(current_span)
             .await
     });
@@ -65,9 +63,8 @@ pub async fn handle_peer(
     let current_span = tracing::Span::current();
     let write_tx = child_tx.clone();
     let write_rx = child_tx.subscribe();
-    let write_state = peer_state.clone();
     set.spawn(async move {
-        connection::write_peer(write_tx, write_rx, write_stream, write_state, choked_rx)
+        connection::write_peer(write_tx, write_rx, write_stream, receiver)
             .instrument(current_span)
             .await
     });

@@ -16,7 +16,7 @@ use once_cell::sync::OnceCell;
 use rand::seq::SliceRandom;
 use tokio::sync::RwLock;
 use tokio::{net::TcpListener, select, sync::broadcast, task::JoinSet};
-use tracing::{Instrument, error, info, warn};
+use tracing::{Instrument, error, info, warn, debug};
 
 pub(crate) static OUTPUT_DIR: OnceCell<Option<String>> = OnceCell::new();
 
@@ -69,6 +69,8 @@ impl Client {
         let mut set: JoinSet<Result<()>> = JoinSet::new();
 
         let my_bitfield = self.download.bitfield();
+
+        debug!("my_bitfield={my_bitfield:?}");
 
         let mut download = self.download.clone();
         let file_tx = tx.clone();
@@ -133,6 +135,7 @@ impl Client {
         )
         .await
         .context("Unable to contact tracker.")?;
+        debug!("response={res:?}");
         match res {
             tracker::Response::Success { peers, .. } => Ok(peers.0),
             tracker::Response::Error { failure_reason } => {
@@ -148,6 +151,7 @@ impl Client {
         tx: broadcast::Sender<ThreadUpdate>,
         bitfield: Arc<RwLock<BitVec<u8, Msb0>>>,
     ) -> Result<()> {
+        info!("peers={peers:?}");
         peers.shuffle(&mut rand::rng());
         for peer in peers.iter().take(self.config.args.max_peers) {
             let mut stream = match tokio::net::TcpStream::connect(peer)
