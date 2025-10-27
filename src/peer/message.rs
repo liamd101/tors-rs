@@ -111,24 +111,54 @@ pub enum MessageId {
     /// Indicates a message containing piece data
     ///
     /// The payload contains the following information in order:
-    ///   index : u32 integer specifying the zero-based piece index
-    ///   begin : u32 integer specifying the zero-based byte offset within the piece
+    ///   index : u32 specifying the zero-based piece index
+    ///   begin : u32 specifying the zero-based byte offset within the piece
     ///   block : block of data, which is a subset of the piece specified by index
     Piece = 7,
     /// Indicates a fixed-length message to cancel block requests
     ///
     /// The payload contains the following information in order:
-    ///   index  : u32 integer specifying the zero-based piece index
-    ///   begin  : u32 integer specifying the zero-based byte offset within the piece
-    ///   length : u32 integer specifying the requested length
-    ///
-    /// It is typically used during "End Game".
+    ///   index  : u32 specifying the zero-based piece index
+    ///   begin  : u32 specifying the zero-based byte offset within the piece
+    ///   length : u32 specifying the requested length
     Cancel = 8,
     /// Indicates the port that this peer's DHT node is listening on.
     /// Typically sent by newer versions of the Mainline that implements a DHT tracker.
     ///
     /// This peer should be inserted in the local routing table if DHT tracker is supported.
     Port = 9,
+
+    // Fast Extension Messages
+    // If the Fast Extension is disabled, then we must close the connection upon receiving any of
+    // these messages.
+    // More detailed descriptions of these message tags and their use cases can be found at
+    // www.bittorrent.org/beps/bep_0006.html
+
+    /// Advisory message, meaning "you might like to download this piece"
+    /// Intended for "super-seeding", to avoid redundant downloads, and so I/O bound seeds can
+    /// upload multiple pieces without having to do excessive disk reads.
+    /// 
+    /// Payload:
+    ///   index : u32 integer specifying the zero-based piece index
+    SuggestPiece = 0x0D,
+    /// This client is a seed and contains all pieces.
+    /// This should be preferred over sending the BitField when possible, since there is less
+    /// message overhead
+    HaveAll = 0x0E,
+    /// This client is a leech and contains no pieces.
+    /// This should be preferred over sending the BitField when possible, since there is less
+    /// message overhead
+    HaveNone = 0x0F,
+    /// Notifies a requesting peer that its request will not be satisfied
+    ///
+    /// Payload:
+    ///   index  : u32 specifying the zero-based piece index
+    ///   begin  : u32 specifying the zero-based byte offset within the piece
+    ///   length : u32 specifying the requested length
+    RejectRequest = 0x10,
+    /// Advisory message indicating that if a client requests for a piece *even when choked*, the
+    /// peer will send it
+    AllowedFast = 0x11,
 }
 
 impl TryFrom<u8> for MessageId {
@@ -145,6 +175,11 @@ impl TryFrom<u8> for MessageId {
             7 => Ok(MessageId::Piece),
             8 => Ok(MessageId::Cancel),
             9 => Ok(MessageId::Port),
+            0x0D => Ok(MessageId::SuggestPiece),
+            0x0E => Ok(MessageId::HaveAll),
+            0x0F => Ok(MessageId::HaveNone),
+            0x10 => Ok(MessageId::RejectRequest),
+            0x11 => Ok(MessageId::AllowedFast),
             _ => Err(anyhow::anyhow!("Invalid MessageId {val}")),
         }
     }
