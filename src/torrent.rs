@@ -90,9 +90,9 @@ impl Client {
         loop {
             select! {
                 Ok((mut stream, socket_addr)) = self.listener.accept() => {
-                    let handshake = Handshake::v1(&self.config, self.metadata.info_hash(), self.config.peer_id);
+                    let my_handshake = Handshake::v1(&self.config, self.metadata.info_hash(), self.config.peer_id);
                     debug!("Received connection from peer {socket_addr}");
-                    let Ok(handshake) = try_handshake(&mut stream, &handshake).await else {
+                    let Ok(handshake) = try_handshake(&mut stream, &my_handshake).await else {
                         warn!("Peer handshake failed");
                         continue;
                     };
@@ -101,10 +101,11 @@ impl Client {
                         let tx = tx.clone();
                         let thread_rx = tx.subscribe();
                         let bitfield = my_bitfield.clone();
+                        let reserved = my_handshake.reserved & handshake.reserved;
 
                         set.spawn(async move {
                             let span = tracing::info_span!("peer", peer_id=%String::from_utf8_lossy(&handshake.peer_id));
-                            handle_peer(tx, thread_rx, stream, metadata, bitfield)
+                            handle_peer(tx, thread_rx, stream, reserved, metadata, bitfield)
                                 .instrument(span)
                                 .await
                         });
@@ -165,19 +166,19 @@ impl Client {
                 }
             };
 
-            let handshake =
+            let my_handshake =
                 Handshake::v1(&self.config, self.metadata.info_hash(), self.config.peer_id);
-
-            match try_handshake(&mut stream, &handshake).await {
+            match try_handshake(&mut stream, &my_handshake).await {
                 Ok(Some(handshake)) => {
                     let metadata = self.metadata.clone();
                     let tx = tx.clone();
                     let thread_rx = tx.subscribe();
                     let bitfield = bitfield.clone();
+                    let reserved = my_handshake.reserved & handshake.reserved;
 
                     task_set.spawn(async move {
                         let span = tracing::info_span!("peer", peer_id = %String::from_utf8_lossy(&handshake.peer_id));
-                        handle_peer(tx, thread_rx, stream, metadata, bitfield)
+                        handle_peer(tx, thread_rx, stream, reserved, metadata, bitfield)
                             .instrument(span)
                             .await
                     });

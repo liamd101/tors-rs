@@ -10,6 +10,21 @@ impl Reserved {
     pub fn as_bytes(&self) -> [u8; 8] {
         self.0
     }
+
+    /// Whether or not Fast Extension is enabled in the reserved bytes
+    pub fn supports_fast(&self) -> bool {
+        (self.0[7] & 0x04) != 0
+    }
+}
+impl std::ops::BitAnd for Reserved {
+    type Output = Reserved;
+    fn bitand(self, rhs: Self) -> Self::Output {
+        let mut result = [0u8; 8];
+        for (i, byte) in result.iter_mut().enumerate() {
+            *byte = self.0[i] & rhs.0[i];
+        }
+        Reserved(result)
+    }
 }
 
 impl From<&Config> for Reserved {
