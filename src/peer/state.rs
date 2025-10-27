@@ -1,4 +1,5 @@
 use crate::parsing::Metadata;
+use super::handshake::Reserved;
 
 use std::sync::{Arc, atomic::AtomicBool};
 
@@ -7,6 +8,7 @@ use bitvec::prelude::*;
 use tokio::sync::{Mutex, Notify, RwLock, mpsc};
 
 pub(super) struct PeerState {
+    pub reserved: Reserved,
     /// Metadata for the Torrent file we are downloading from
     pub metadata: Metadata,
     /// Threadsafe pointer to the bitfield of completed pieces
@@ -47,7 +49,7 @@ impl ChannelHalf {
 }
 
 impl PeerState {
-    pub fn channel(metadata: Metadata, my_bitfield: Arc<RwLock<BitVec<u8, Msb0>>>) -> (Self, Self) {
+    pub fn channel(reserved: Reserved, metadata: Metadata, my_bitfield: Arc<RwLock<BitVec<u8, Msb0>>>) -> (Self, Self) {
         let num_pieces = metadata.num_pieces();
 
         let (sender, receiver) = mpsc::channel(16);
@@ -60,6 +62,7 @@ impl PeerState {
         let peer_choking_tmp = Arc::new((Mutex::new(false), Notify::new()));
 
         let sender = Self {
+            reserved,
             metadata: metadata.clone(),
             my_bitfield: my_bitfield.clone(),
             peer_bitfield: peer_bitfield.clone(),
@@ -71,6 +74,7 @@ impl PeerState {
         };
 
         let receiver = Self {
+            reserved,
             metadata: metadata.clone(),
             my_bitfield: my_bitfield.clone(),
             peer_bitfield: peer_bitfield.clone(),

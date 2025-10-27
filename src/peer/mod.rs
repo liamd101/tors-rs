@@ -40,16 +40,17 @@ pub async fn handle_peer(
     parent_tx: broadcast::Sender<ThreadUpdate>,
     mut parent_rx: broadcast::Receiver<ThreadUpdate>,
     stream: TcpStream,
+    reserved: handshake::Reserved,
     metadata: Metadata,
     my_bitfield: Arc<RwLock<BitVec<u8, Msb0>>>,
 ) -> Result<()> {
-    info!("handling peer connection");
+    info!("Beginning Peer Exchange.");
 
     let (read_stream, write_stream) = tokio::io::split(stream);
     let mut set = JoinSet::new();
     let (child_tx, mut child_rx) = broadcast::channel::<ThreadUpdate>(32);
 
-    let (sender, receiver) = PeerState::channel(metadata, my_bitfield);
+    let (sender, receiver) = PeerState::channel(reserved, metadata, my_bitfield);
 
     let current_span = tracing::Span::current();
     let read_tx = child_tx.clone();
@@ -121,6 +122,7 @@ pub async fn handle_peer(
         }
     }
 
+    info!("Disconnected.");
     if let (Some(read), Some(write)) = (read_stream, write_stream) {
         let mut stream = read.unsplit(write);
         stream.shutdown().await?;

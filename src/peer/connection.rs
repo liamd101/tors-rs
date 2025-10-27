@@ -123,6 +123,7 @@ pub(super) async fn write_peer(
     Ok(ChildUpdates::Write(stream))
 }
 
+#[allow(unreachable_patterns)]
 mod read_peer {
     use crate::{
         ThreadUpdate,
@@ -336,6 +337,52 @@ mod read_peer {
                 warn!("Port message received. This is unhandled.");
                 stream.read_u16().await.context("Reading peer DHT port")?;
             }
+
+            MessageId::HaveAll => {
+                if !peer_state.reserved.supports_fast() {
+                    tx.send(ThreadUpdate::Disconnect)
+                        .context("Sending disconnect message")?;
+                }
+                // if the peer has the entire file and we are missing some, then we should be
+                // interested
+                if !peer_state.my_bitfield.read().await.all() {
+                    peer_state.am_interested.1.notify_one();
+                    *peer_state.am_interested.0.lock().await = true;
+                }
+            }
+
+            MessageId::HaveNone => {
+                if !peer_state.reserved.supports_fast() {
+                    tx.send(ThreadUpdate::Disconnect)
+                        .context("Sending disconnect message")?;
+                }
+                // no matter what, we are not interested in this peer
+                peer_state.am_interested.1.notify_one();
+                *peer_state.am_interested.0.lock().await = false;
+            }
+
+            MessageId::SuggestPiece => {
+                if !peer_state.reserved.supports_fast() {
+                    tx.send(ThreadUpdate::Disconnect)
+                        .context("Sending disconnect message")?;
+                }
+            }
+
+            MessageId::RejectRequest => {
+                if !peer_state.reserved.supports_fast() {
+                    tx.send(ThreadUpdate::Disconnect)
+                        .context("Sending disconnect message")?;
+                }
+            }
+
+            MessageId::AllowedFast => {
+                if !peer_state.reserved.supports_fast() {
+                    tx.send(ThreadUpdate::Disconnect)
+                        .context("Sending disconnect message")?;
+                }
+            }
+
+            _ => todo!(),
         }
 
         Ok(())
