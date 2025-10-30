@@ -44,7 +44,7 @@ pub(super) async fn read_peer(
 }
 
 pub(super) async fn write_peer(
-    _tx: broadcast::Sender<ThreadUpdate>,
+    tx: broadcast::Sender<ThreadUpdate>,
     mut rx: broadcast::Receiver<ThreadUpdate>,
     mut stream: tokio::io::WriteHalf<TcpStream>,
     mut peer_state: PeerState,
@@ -54,12 +54,24 @@ pub(super) async fn write_peer(
         peer_state.metadata.info.torr_type.len(),
         peer_state.metadata.info.piece_length,
     );
-    requested.update(&*peer_state.my_bitfield.read().await);
+    let my_bitfield = peer_state.my_bitfield.read().await;
+    requested.update(&*my_bitfield);
 
-    if peer_state.my_bitfield.read().await.any() {
+    if peer_state.reserved.supports_fast() {
+        if my_bitfield.all() {
+            stream.write_all(&Message::have_all().as_bytes()).await?;
+            debug!("sent HaveAll");
+        } else if !my_bitfield.any() {
+            stream.write_all(&Message::have_none().as_bytes()).await?;
+            debug!("sent HaveNone");
+        }
+    } else if my_bitfield.any() {
         write_peer::send_bitfield(&mut stream, &peer_state).await?;
         debug!("sending my bitfield");
     }
+
+    // explicitly drop my_bitfield here so that other threads can actually access it
+    drop(my_bitfield);
     stream
         .write_all(&Message::unchoke().as_bytes())
         .await
@@ -76,11 +88,22 @@ pub(super) async fn write_peer(
                 }
             }
 
+            // if peer has requested something from us, and we have it, send the piece data
             Some((piece_idx, begin, data_len)) = peer_state.request_queue.recv() => {
                 if peer_state.am_choking.load(std::sync::atomic::Ordering::Relaxed) {
                     continue;
                 }
-                let data = peer_state.metadata.get_piece_data(piece_idx as u64, begin as u64, data_len as u64).await.context("getting piece data")?;
+                // using this crate is so fucking stupid sometimes
+                if !peer_state.my_bitfield.read().await.get(piece_idx as usize).as_deref().unwrap_or(&false) {
+                    // if the peer requests something we don't have, we should sever the connection
+                    tx.send(ThreadUpdate::Disconnect)?;
+                    break;
+                }
+                let data = peer_state
+                    .metadata
+                    .get_piece_data(piece_idx as u64, begin as u64, data_len as u64)
+                    .await
+                    .context("getting piece data")?;
                 stream.write_all(&Message {
                     length: data.len() as u32 + 9,
                     message_id: Some(MessageId::Piece),
@@ -257,9 +280,9 @@ mod read_peer {
                     .request_queue
                     .send((piece_index, begin, data_len))
                     .await?;
-                debug!("piece_index={piece_index}");
-                debug!("begin={begin}");
-                debug!("data_len={data_len}");
+                debug!(
+                    "peer requested piece_index={piece_index} begin={begin} data_len={data_len}"
+                );
             }
 
             MessageId::Cancel => {
@@ -329,7 +352,6 @@ mod read_peer {
                     debug!(filename=?filename,"wrote {bytes_to_write} bytes to {file_offset}");
                     piece_position += bytes_to_write as usize;
                 }
-                debug!("Downloaded part of piece={piece_index}");
                 tx.send(ThreadUpdate::Downloaded(piece_index, begin / BLOCK_SIZE))?;
             }
 
@@ -345,6 +367,7 @@ mod read_peer {
                 }
                 // if the peer has the entire file and we are missing some, then we should be
                 // interested
+                peer_state.peer_bitfield.write().await.fill(true);
                 if !peer_state.my_bitfield.read().await.all() {
                     peer_state.am_interested.1.notify_one();
                     *peer_state.am_interested.0.lock().await = true;
@@ -356,6 +379,7 @@ mod read_peer {
                     tx.send(ThreadUpdate::Disconnect)
                         .context("Sending disconnect message")?;
                 }
+                peer_state.peer_bitfield.write().await.fill(false);
                 // no matter what, we are not interested in this peer
                 peer_state.am_interested.1.notify_one();
                 *peer_state.am_interested.0.lock().await = false;
@@ -504,54 +528,6 @@ mod write_peer {
                 .context("writing block_size")?;
             stream.flush().await.context("Flushing interested")?;
         }
-
-        // if peer is interested in what we have, we want to send them some piece data
-        /*
-        if peer_state.interested.load(Ordering::Relaxed)
-            && let Some((piece_index, begin, data_len)) =
-                peer_state.request_queue.lock().await.pop_front()
-        {
-            if !peer_state
-                .my_bitfield
-                .read()
-                .await
-                .get(piece_index as usize)
-                .as_deref()
-                .unwrap_or(&false)
-            {
-                warn!("Don't have requested piece");
-                return Ok(());
-            }
-
-            let piece_data = peer_state
-                .metadata
-                .get_piece_data(piece_index as u64, begin as u64, data_len as u64)
-                .await
-                .context("Reading piece data from files")?;
-
-            let message_header = Message {
-                message_id: Some(MessageId::Piece),
-                length: 13 + data_len,
-            };
-            stream
-                .write_all(&message_header.as_bytes())
-                .await
-                .context("Writing Piece header to stream")?;
-            stream
-                .write_u32(piece_index)
-                .await
-                .context("Writing Piece index")?;
-            stream.write_u32(begin).await.context("Writing Begin")?;
-            stream
-                .write_u32(data_len)
-                .await
-                .context("Writing Data length")?;
-            stream
-                .write_all(&piece_data)
-                .await
-                .context("Writing piece data to stream")?;
-        }
-        */
 
         Ok(())
     }

@@ -7,7 +7,7 @@ use tracing_subscriber::EnvFilter;
 #[command(version)]
 pub struct Args {
     /// Controls the log level of the program
-    #[arg(short='v', long)]
+    #[arg(short = 'v', long)]
     pub verbose: bool,
 
     /// The input .torrent file to download
@@ -19,11 +19,11 @@ pub struct Args {
     pub max_peers: usize,
 
     /// Directory to write the file contents to. Defaults to `out` or path specified by input file
-    #[arg(short='d', long)]
+    #[arg(short = 'd', long)]
     pub dir: Option<String>,
 
     /// Whether or not to use the Fast Extension (BEP0006)
-    #[arg(short='F', long)]
+    #[arg(short = 'F', long)]
     pub fast_extension: bool,
 }
 
@@ -51,10 +51,7 @@ impl Config {
         peer_id[7] = b'-';
         rand::rng().fill_bytes(&mut peer_id[8..]);
 
-        Ok(Config {
-            args,
-            peer_id,
-        })
+        Ok(Config { args, peer_id })
     }
 }
 

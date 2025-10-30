@@ -69,6 +69,20 @@ impl Message {
             message_id: Some(MessageId::Choke),
         }
     }
+
+    pub fn have_none() -> Self {
+        Self {
+            length: 1,
+            message_id: Some(MessageId::HaveNone),
+        }
+    }
+
+    pub fn have_all() -> Self {
+        Self {
+            length: 1,
+            message_id: Some(MessageId::HaveAll),
+        }
+    }
 }
 
 /// Enum representing the type of messages supported by the BitTorrent protocol
@@ -133,11 +147,10 @@ pub enum MessageId {
     // these messages.
     // More detailed descriptions of these message tags and their use cases can be found at
     // www.bittorrent.org/beps/bep_0006.html
-
     /// Advisory message, meaning "you might like to download this piece"
     /// Intended for "super-seeding", to avoid redundant downloads, and so I/O bound seeds can
     /// upload multiple pieces without having to do excessive disk reads.
-    /// 
+    ///
     /// Payload:
     ///   index : u32 integer specifying the zero-based piece index
     SuggestPiece = 0x0D,

@@ -1,5 +1,5 @@
-use crate::parsing::Metadata;
 use super::handshake::Reserved;
+use crate::parsing::Metadata;
 
 use std::sync::{Arc, atomic::AtomicBool};
 
@@ -49,7 +49,11 @@ impl ChannelHalf {
 }
 
 impl PeerState {
-    pub fn channel(reserved: Reserved, metadata: Metadata, my_bitfield: Arc<RwLock<BitVec<u8, Msb0>>>) -> (Self, Self) {
+    pub fn channel(
+        reserved: Reserved,
+        metadata: Metadata,
+        my_bitfield: Arc<RwLock<BitVec<u8, Msb0>>>,
+    ) -> (Self, Self) {
         let num_pieces = metadata.num_pieces();
 
         let (sender, receiver) = mpsc::channel(16);
