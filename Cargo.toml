@@ -3,10 +3,12 @@ authors = ["Liam Dodds <liamdodds101@gmail.com>"]
 name = "tors-rs"
 version = "0.1.0"
 edition = "2024"
-description = "A Bittorrent Client"
+description = "A Bittorrent Client implementation in Rust"
 readme = "README.md"
 repository = "https://github.com/liamd101/tors-rs"
 license = "MIT"
+keywords = ["bittorrent", "p2p", "torrent", "networking"]
+categories = ["network-programming"]
 
 [profile.release]
 strip = true
