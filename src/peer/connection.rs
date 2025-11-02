@@ -70,15 +70,19 @@ pub(super) async fn write_peer(
         debug!("sending my bitfield");
     }
 
+    if my_bitfield.any() {
+        // only want to unchoke the peer when we have data to send, otherwise its pointless
+        stream
+            .write_all(&Message::unchoke().as_bytes())
+            .await
+            .context("unchoking peer")?;
+        peer_state
+            .am_choking
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+
     // explicitly drop my_bitfield here so that other threads can actually access it
     drop(my_bitfield);
-    stream
-        .write_all(&Message::unchoke().as_bytes())
-        .await
-        .context("unchoking peer")?;
-    peer_state
-        .am_choking
-        .store(false, std::sync::atomic::Ordering::Release);
 
     loop {
         select! {
