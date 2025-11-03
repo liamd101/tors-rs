@@ -1,4 +1,5 @@
 use super::handshake::Reserved;
+use super::Piece;
 use crate::parsing::Metadata;
 
 use std::sync::{Arc, atomic::AtomicBool};
@@ -29,18 +30,18 @@ pub(super) struct PeerState {
     pub peer_interested: Arc<AtomicBool>,
 }
 pub(super) enum ChannelHalf {
-    Sender(mpsc::Sender<(u32, u32, u32)>),
-    Receiver(mpsc::Receiver<(u32, u32, u32)>),
+    Sender(mpsc::Sender<Piece>),
+    Receiver(mpsc::Receiver<Piece>),
 }
 impl ChannelHalf {
-    pub async fn recv(&mut self) -> Option<(u32, u32, u32)> {
+    pub async fn recv(&mut self) -> Option<Piece> {
         match self {
             Self::Sender(_) => None,
             Self::Receiver(receiver) => receiver.recv().await,
         }
     }
 
-    pub async fn send(&self, value: (u32, u32, u32)) -> Result<()> {
+    pub async fn send(&self, value: Piece) -> Result<()> {
         match self {
             Self::Sender(sender) => sender.send(value).await.context("Sending value"),
             Self::Receiver(_) => Err(anyhow::anyhow!("Invalid call on Receiver")),

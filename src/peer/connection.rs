@@ -55,7 +55,7 @@ pub(super) async fn write_peer(
         peer_state.metadata.info.piece_length,
     );
     let my_bitfield = peer_state.my_bitfield.read().await;
-    requested.update(&*my_bitfield);
+    requested.update(&my_bitfield);
 
     if peer_state.reserved.supports_fast() {
         if my_bitfield.all() {
@@ -93,29 +93,29 @@ pub(super) async fn write_peer(
             }
 
             // if peer has requested something from us, and we have it, send the piece data
-            Some((piece_idx, begin, data_len)) = peer_state.request_queue.recv() => {
+            Some(piece) = peer_state.request_queue.recv() => {
                 if peer_state.am_choking.load(std::sync::atomic::Ordering::Relaxed) {
                     continue;
                 }
                 // using this crate is so fucking stupid sometimes
-                if !peer_state.my_bitfield.read().await.get(piece_idx as usize).as_deref().unwrap_or(&false) {
+                if !peer_state.my_bitfield.read().await.get(piece.piece_idx as usize).as_deref().unwrap_or(&false) {
                     // if the peer requests something we don't have, we should sever the connection
                     tx.send(ThreadUpdate::Disconnect)?;
                     break;
                 }
                 let data = peer_state
                     .metadata
-                    .get_piece_data(piece_idx as u64, begin as u64, data_len as u64)
+                    .get_piece_data(piece.piece_idx as u64, piece.begin as u64, piece.data_len as u64)
                     .await
                     .context("getting piece data")?;
                 stream.write_all(&Message {
                     length: data.len() as u32 + 9,
                     message_id: Some(MessageId::Piece),
                 }.as_bytes()).await?;
-                stream.write_u32(piece_idx).await.context("sending piece index")?;
-                stream.write_u32(begin).await.context("sending begin")?;
+                stream.write_u32(piece.piece_idx).await.context("sending piece index")?;
+                stream.write_u32(piece.begin).await.context("sending begin")?;
                 stream.write_all(&data).await.context("writing piece data")?;
-                debug!("sent piece_idx={piece_idx} begin={begin} data_len={data_len}");
+                debug!("sent piece_idx={} begin={} data_len={}", piece.piece_idx, piece.begin, piece.data_len);
             }
 
             _ = tokio::time::sleep(tokio::time::Duration::from_millis(10)) => {
@@ -156,7 +156,7 @@ mod read_peer {
         ThreadUpdate,
         parsing::TorrentType,
         peer::{
-            BLOCK_SIZE,
+            BLOCK_SIZE, Piece,
             message::{Message, MessageId},
             state::PeerState,
         },
@@ -277,20 +277,22 @@ mod read_peer {
             }
 
             MessageId::Request => {
-                let piece_index: u32 = stream.read_u32().await.context("reading piece index")?;
+                let piece_idx: u32 = stream.read_u32().await.context("reading piece index")?;
                 let begin: u32 = stream.read_u32().await.context("reading piece index")?;
                 let data_len: u32 = stream.read_u32().await.context("reading piece index")?;
                 peer_state
                     .request_queue
-                    .send((piece_index, begin, data_len))
+                    .send(Piece {
+                        piece_idx,
+                        begin,
+                        data_len,
+                    })
                     .await?;
-                debug!(
-                    "peer requested piece_index={piece_index} begin={begin} data_len={data_len}"
-                );
+                debug!("peer requested piece_index={piece_idx} begin={begin} data_len={data_len}");
             }
 
             MessageId::Cancel => {
-                let piece_index: u32 = stream.read_u32().await.context("reading piece index")?;
+                let piece_idx: u32 = stream.read_u32().await.context("reading piece index")?;
                 let begin: u32 = stream.read_u32().await.context("reading block begin")?;
                 stream.read_u32().await.context("reading data len")?;
                 if peer_state.am_choking.load(Ordering::Relaxed) {
@@ -298,7 +300,11 @@ mod read_peer {
                 }
                 peer_state
                     .request_queue
-                    .send((piece_index, begin, 0))
+                    .send(Piece {
+                        piece_idx,
+                        begin,
+                        data_len: 0,
+                    })
                     .await
                     .context("Sending cancel message")?;
             }

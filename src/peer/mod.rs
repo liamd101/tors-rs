@@ -14,6 +14,14 @@ enum BlockState {
     Completed,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Piece {
+    pub piece_idx: u32,
+    pub begin: u32,
+    pub data_len: u32,
+}
+
 use std::sync::Arc;
 
 use anyhow::Result;
