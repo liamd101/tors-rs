@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = Config::from_args().context("Failed to parse configuration")?;
-    init_logging(&config);
+    init_logging(&config)?;
 
     let client = Client::new(config)
         .await
